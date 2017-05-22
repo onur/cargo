@@ -787,6 +787,9 @@ fn build_deps_args(cmd: &mut ProcessBuilder, cx: &mut Context, unit: &Unit)
             v.push(&path::MAIN_SEPARATOR.to_string());
             v.push(&dst.file_name().unwrap());
             cmd.arg("--extern").arg(&v);
+            cmd.arg("--extern-version").arg(&format!("{}={},{}", unit.target.crate_name(),
+                                                                 unit.pkg.name(),
+                                                                 unit.pkg.version()));
         }
         Ok(())
     }
