@@ -28,6 +28,7 @@ extern crate tempdir;
 extern crate term;
 extern crate toml;
 extern crate url;
+extern crate rustc_version;
 
 use std::io;
 use std::fmt;

@@ -45,6 +45,7 @@ tempdir = "0.3"
 term = "0.4.4"
 toml = "0.4"
 url = "1.1"
+rustc_version = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 openssl = "0.9"
