@@ -4,7 +4,6 @@ extern crate flate2;
 extern crate git2;
 extern crate hamcrest;
 extern crate tar;
-extern crate cargo;
 
 use std::fs::File;
 use std::io::prelude::*;
@@ -12,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use cargotest::{cargo_process, process};
 use cargotest::support::{project, execs, paths, git, path2url, cargo_exe};
+use cargotest::support::registry::Package;
 use flate2::read::GzDecoder;
-use hamcrest::{assert_that, existing_file, contains};
+use hamcrest::{assert_that, existing_file, contains, equal_to};
 use tar::Archive;
 
 #[test]
@@ -62,6 +62,7 @@ src[/]main.rs
         let fname = f.header().path_bytes();
         let fname = &*fname;
         assert!(fname == b"foo-0.0.1/Cargo.toml" ||
+                fname == b"foo-0.0.1/Cargo.toml.orig" ||
                 fname == b"foo-0.0.1/src/main.rs",
                 "unexpected filename: {:?}", f.header().path())
     }
@@ -249,21 +250,128 @@ fn exclude() {
             name = "foo"
             version = "0.0.1"
             authors = []
-            exclude = ["*.txt"]
+            exclude = [
+                "*.txt",
+                # file in root
+                "file_root_1",       # NO_CHANGE (ignored)
+                "/file_root_2",      # CHANGING (packaged -> ignored)
+                "file_root_3/",      # NO_CHANGE (packaged)
+                "file_root_4/*",     # NO_CHANGE (packaged)
+                "file_root_5/**",    # NO_CHANGE (packaged)
+                # file in sub-dir
+                "file_deep_1",       # CHANGING (packaged -> ignored)
+                "/file_deep_2",      # NO_CHANGE (packaged)
+                "file_deep_3/",      # NO_CHANGE (packaged)
+                "file_deep_4/*",     # NO_CHANGE (packaged)
+                "file_deep_5/**",    # NO_CHANGE (packaged)
+                # dir in root
+                "dir_root_1",        # CHANGING (packaged -> ignored)
+                "/dir_root_2",       # CHANGING (packaged -> ignored)
+                "dir_root_3/",       # CHANGING (packaged -> ignored)
+                "dir_root_4/*",      # NO_CHANGE (ignored)
+                "dir_root_5/**",     # NO_CHANGE (ignored)
+                # dir in sub-dir
+                "dir_deep_1",        # CHANGING (packaged -> ignored)
+                "/dir_deep_2",       # NO_CHANGE
+                "dir_deep_3/",       # CHANGING (packaged -> ignored)
+                "dir_deep_4/*",      # CHANGING (packaged -> ignored)
+                "dir_deep_5/**",     # CHANGING (packaged -> ignored)
+            ]
         "#)
         .file("src/main.rs", r#"
             fn main() { println!("hello"); }
         "#)
         .file("bar.txt", "")
-        .file("src/bar.txt", "");
+        .file("src/bar.txt", "")
+        // file in root
+        .file("file_root_1", "")
+        .file("file_root_2", "")
+        .file("file_root_3", "")
+        .file("file_root_4", "")
+        .file("file_root_5", "")
+        // file in sub-dir
+        .file("some_dir/file_deep_1", "")
+        .file("some_dir/file_deep_2", "")
+        .file("some_dir/file_deep_3", "")
+        .file("some_dir/file_deep_4", "")
+        .file("some_dir/file_deep_5", "")
+        // dir in root
+        .file("dir_root_1/some_dir/file", "")
+        .file("dir_root_2/some_dir/file", "")
+        .file("dir_root_3/some_dir/file", "")
+        .file("dir_root_4/some_dir/file", "")
+        .file("dir_root_5/some_dir/file", "")
+        // dir in sub-dir
+        .file("some_dir/dir_deep_1/some_dir/file", "")
+        .file("some_dir/dir_deep_2/some_dir/file", "")
+        .file("some_dir/dir_deep_3/some_dir/file", "")
+        .file("some_dir/dir_deep_4/some_dir/file", "")
+        .file("some_dir/dir_deep_5/some_dir/file", "")
+        ;
 
     assert_that(p.cargo_process("package").arg("--no-verify").arg("-v"),
-                execs().with_status(0).with_stderr("\
+                execs().with_status(0).with_stdout("").with_stderr("\
 [WARNING] manifest has no description[..]
 See http://doc.crates.io/manifest.html#package-metadata for more info.
 [PACKAGING] foo v0.0.1 ([..])
+[WARNING] [..] file `dir_root_1[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `dir_root_2[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `dir_root_3[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `some_dir[/]dir_deep_1[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `some_dir[/]dir_deep_3[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `some_dir[/]dir_deep_4[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `some_dir[/]dir_deep_5[/]some_dir[/]file` WILL be excluded [..]
+See [..]
+[WARNING] [..] file `some_dir[/]file_deep_1` WILL be excluded [..]
+See [..]
 [ARCHIVING] [..]
 [ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+[ARCHIVING] [..]
+"));
+
+    assert_that(&p.root().join("target/package/foo-0.0.1.crate"), existing_file());
+
+    assert_that(p.cargo("package").arg("-l"),
+                execs().with_status(0).with_stdout("\
+Cargo.toml
+dir_root_1[/]some_dir[/]file
+dir_root_2[/]some_dir[/]file
+dir_root_3[/]some_dir[/]file
+file_root_3
+file_root_4
+file_root_5
+some_dir[/]dir_deep_1[/]some_dir[/]file
+some_dir[/]dir_deep_2[/]some_dir[/]file
+some_dir[/]dir_deep_3[/]some_dir[/]file
+some_dir[/]dir_deep_4[/]some_dir[/]file
+some_dir[/]dir_deep_5[/]some_dir[/]file
+some_dir[/]file_deep_1
+some_dir[/]file_deep_2
+some_dir[/]file_deep_3
+some_dir[/]file_deep_4
+some_dir[/]file_deep_5
+src[/]main.rs
 "));
 }
 
@@ -423,6 +531,7 @@ src[..]main.rs
         let fname = f.header().path_bytes();
         let fname = &*fname;
         assert!(fname == b"nested-0.0.1/Cargo.toml" ||
+                fname == b"nested-0.0.1/Cargo.toml.orig" ||
                 fname == b"nested-0.0.1/src/main.rs",
                 "unexpected filename: {:?}", f.header().path())
     }
@@ -587,4 +696,156 @@ Cargo.toml
 
 to proceed despite this, pass the `--allow-dirty` flag
 "));
+}
+
+#[test]
+fn generated_manifest() {
+    let p = project("foo")
+        .file("Cargo.toml", r#"
+            [project]
+            name = "foo"
+            version = "0.0.1"
+            authors = []
+            exclude = ["*.txt"]
+            license = "MIT"
+            description = "foo"
+
+            [project.metadata]
+            foo = 'bar'
+
+            [workspace]
+
+            [dependencies]
+            bar = { path = "bar", version = "0.1" }
+        "#)
+        .file("src/main.rs", "")
+        .file("bar/Cargo.toml", r#"
+            [package]
+            name = "bar"
+            version = "0.1.0"
+            authors = []
+        "#)
+        .file("bar/src/lib.rs", "");
+
+    assert_that(p.cargo_process("package").arg("--no-verify"),
+                execs().with_status(0));
+
+    let f = File::open(&p.root().join("target/package/foo-0.0.1.crate")).unwrap();
+    let mut rdr = GzDecoder::new(f).unwrap();
+    let mut contents = Vec::new();
+    rdr.read_to_end(&mut contents).unwrap();
+    let mut ar = Archive::new(&contents[..]);
+    let mut entry = ar.entries().unwrap()
+                        .map(|f| f.unwrap())
+                        .find(|e| e.path().unwrap().ends_with("Cargo.toml"))
+                        .unwrap();
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents).unwrap();
+    assert_that(&contents[..], equal_to(
+r#"# THIS FILE IS AUTOMATICALLY GENERATED BY CARGO
+#
+# When uploading crates to the registry Cargo will automatically
+# "normalize" Cargo.toml files for maximal compatibility
+# with all versions of Cargo and also rewrite `path` dependencies
+# to registry (e.g. crates.io) dependencies
+#
+# If you believe there's an error in this file please file an
+# issue against the rust-lang/cargo repository. If you're
+# editing this file be aware that the upstream Cargo.toml
+# will likely look very different (and much more reasonable)
+
+[package]
+name = "foo"
+version = "0.0.1"
+authors = []
+exclude = ["*.txt"]
+description = "foo"
+license = "MIT"
+
+[package.metadata]
+foo = "bar"
+[dependencies.bar]
+version = "0.1"
+"#));
+}
+
+#[test]
+fn ignore_workspace_specifier() {
+    let p = project("foo")
+        .file("Cargo.toml", r#"
+            [project]
+            name = "foo"
+            version = "0.0.1"
+
+            authors = []
+
+            [workspace]
+
+            [dependencies]
+            bar = { path = "bar", version = "0.1" }
+        "#)
+        .file("src/main.rs", "")
+        .file("bar/Cargo.toml", r#"
+            [package]
+            name = "bar"
+            version = "0.1.0"
+            authors = []
+            workspace = ".."
+        "#)
+        .file("bar/src/lib.rs", "");
+    p.build();
+
+    assert_that(p.cargo("package").arg("--no-verify").cwd(p.root().join("bar")),
+                execs().with_status(0));
+
+    let f = File::open(&p.root().join("target/package/bar-0.1.0.crate")).unwrap();
+    let mut rdr = GzDecoder::new(f).unwrap();
+    let mut contents = Vec::new();
+    rdr.read_to_end(&mut contents).unwrap();
+    let mut ar = Archive::new(&contents[..]);
+    let mut entry = ar.entries().unwrap()
+                        .map(|f| f.unwrap())
+                        .find(|e| e.path().unwrap().ends_with("Cargo.toml"))
+                        .unwrap();
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents).unwrap();
+    assert_that(&contents[..], equal_to(
+r#"# THIS FILE IS AUTOMATICALLY GENERATED BY CARGO
+#
+# When uploading crates to the registry Cargo will automatically
+# "normalize" Cargo.toml files for maximal compatibility
+# with all versions of Cargo and also rewrite `path` dependencies
+# to registry (e.g. crates.io) dependencies
+#
+# If you believe there's an error in this file please file an
+# issue against the rust-lang/cargo repository. If you're
+# editing this file be aware that the upstream Cargo.toml
+# will likely look very different (and much more reasonable)
+
+[package]
+name = "bar"
+version = "0.1.0"
+authors = []
+"#));
+}
+
+#[test]
+fn package_two_kinds_of_deps() {
+    Package::new("other", "1.0.0").publish();
+    Package::new("other1", "1.0.0").publish();
+    let p = project("foo")
+        .file("Cargo.toml", r#"
+            [project]
+            name = "foo"
+            version = "0.0.1"
+            authors = []
+
+            [dependencies]
+            other = "1.0"
+            other1 = { version = "1.0" }
+        "#)
+        .file("src/main.rs", "");
+
+    assert_that(p.cargo_process("package").arg("--no-verify"),
+                execs().with_status(0));
 }

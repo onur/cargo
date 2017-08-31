@@ -1,9 +1,11 @@
+use std::env;
+
 use cargo::core::Workspace;
 use cargo::ops::{self, MessageFormat, Packages};
-use cargo::util::{CliResult, CliError, Human, human, Config};
+use cargo::util::{CliResult, CliError, Config, CargoErrorKind};
 use cargo::util::important_paths::find_root_manifest_for_wd;
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options {
     arg_args: Vec<String>,
     flag_features: Vec<String>,
@@ -24,6 +26,7 @@ pub struct Options {
     flag_tests: bool,
     flag_bench: Vec<String>,
     flag_benches: bool,
+    flag_all_targets: bool,
     flag_verbose: u32,
     flag_quiet: Option<bool>,
     flag_color: Option<String>,
@@ -33,6 +36,9 @@ pub struct Options {
     flag_frozen: bool,
     flag_locked: bool,
     flag_all: bool,
+    flag_exclude: Vec<String>,
+    #[serde(rename = "flag_Z")]
+    flag_z: Vec<String>,
 }
 
 pub const USAGE: &'static str = "
@@ -53,10 +59,12 @@ Options:
     --tests                      Test all tests
     --bench NAME ...             Test only the specified bench target
     --benches                    Test all benches
+    --all-targets                Test all targets (default)
     --no-run                     Compile, but don't run tests
     -p SPEC, --package SPEC ...  Package to run tests for
     --all                        Test all packages in the workspace
-    -j N, --jobs N               Number of parallel jobs, defaults to # of CPUs
+    --exclude SPEC ...           Exclude packages from the test
+    -j N, --jobs N               Number of parallel builds, see below for details
     --release                    Build artifacts in release mode, with optimizations
     --features FEATURES          Space-separated list of features to also build
     --all-features               Build all available features
@@ -70,6 +78,7 @@ Options:
     --no-fail-fast               Run all tests regardless of failure
     --frozen                     Require Cargo.lock and cache are up to date
     --locked                     Require Cargo.lock is up to date
+    -Z FLAG ...                  Unstable (nightly-only) flags to Cargo
 
 All of the trailing arguments are passed to the test binaries generated for
 filtering tests and generally providing options configuring how they run. For
@@ -86,7 +95,12 @@ All packages in the workspace are tested if the `--all` flag is supplied. The
 `--all` flag may be supplied in the presence of a virtual manifest.
 
 The --jobs argument affects the building of the test executable but does
-not affect how many jobs are used when running the tests.
+not affect how many jobs are used when running the tests. The default value
+for the --jobs argument is the number of CPUs. If you want to control the
+number of simultaneous running test cases, pass the `--test-threads` option
+to the test binaries:
+
+  cargo test -- --test-threads=1
 
 Compilation can be configured via the `test` profile in the manifest.
 
@@ -102,34 +116,40 @@ To get the list of all options available for the test binaries use this:
 ";
 
 pub fn execute(options: Options, config: &Config) -> CliResult {
+    debug!("executing; cmd=cargo-test; args={:?}",
+           env::args().collect::<Vec<_>>());
+
     config.configure(options.flag_verbose,
                      options.flag_quiet,
                      &options.flag_color,
                      options.flag_frozen,
-                     options.flag_locked)?;
+                     options.flag_locked,
+                     &options.flag_z)?;
 
     let root = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
+    let ws = Workspace::new(&root, config)?;
 
     let empty = Vec::new();
     let (mode, filter);
     if options.flag_doc {
         mode = ops::CompileMode::Doctest;
         filter = ops::CompileFilter::new(true, &empty, false, &empty, false,
-                                               &empty, false, &empty, false);
+                                               &empty, false, &empty, false,
+                                         false);
     } else {
         mode = ops::CompileMode::Test;
         filter = ops::CompileFilter::new(options.flag_lib,
                                          &options.flag_bin, options.flag_bins,
                                          &options.flag_test, options.flag_tests,
                                          &options.flag_example, options.flag_examples,
-                                         &options.flag_bench, options.flag_benches);
+                                         &options.flag_bench, options.flag_benches,
+                                         options.flag_all_targets);
     }
 
-    let spec = if options.flag_all {
-        Packages::All
-    } else {
-        Packages::Packages(&options.flag_package)
-    };
+    let spec = Packages::from_flags(ws.is_virtual(),
+                                    options.flag_all,
+                                    &options.flag_exclude,
+                                    &options.flag_package)?;
 
     let ops = ops::TestOptions {
         no_run: options.flag_no_run,
@@ -152,14 +172,13 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
         },
     };
 
-    let ws = Workspace::new(&root, config)?;
     let err = ops::run_tests(&ws, &ops, &options.arg_args)?;
     match err {
         None => Ok(()),
         Some(err) => {
             Err(match err.exit.as_ref().and_then(|e| e.code()) {
-                Some(i) => CliError::new(human(err.hint()), i),
-                None => CliError::new(Box::new(Human(err)), 101),
+                Some(i) => CliError::new(err.hint().into(), i),
+                None => CliError::new(CargoErrorKind::CargoTestErrorKind(err).into(), 101),
             })
         }
     }

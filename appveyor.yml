@@ -1,39 +1,34 @@
 environment:
-  RUSTFLAGS: -Zunstable-options -Ctarget-feature=+crt-static
+
+  # At the time this was added AppVeyor was having troubles with checking
+  # revocation of SSL certificates of sites like static.rust-lang.org and what
+  # we think is crates.io. The libcurl HTTP client by default checks for
+  # revocation on Windows and according to a mailing list [1] this can be
+  # disabled.
+  #
+  # The `CARGO_HTTP_CHECK_REVOKE` env var here tells cargo to disable SSL
+  # revocation checking on Windows in libcurl. Note, though, that rustup, which
+  # we're using to download Rust here, also uses libcurl as the default backend.
+  # Unlike Cargo, however, rustup doesn't have a mechanism to disable revocation
+  # checking. To get rustup working we set `RUSTUP_USE_HYPER` which forces it to
+  # use the Hyper instead of libcurl backend. Both Hyper and libcurl use
+  # schannel on Windows but it appears that Hyper configures it slightly
+  # differently such that revocation checking isn't turned on by default.
+  #
+  # [1]: https://curl.haxx.se/mail/lib-2016-03/0202.html
+  RUSTUP_USE_HYPER: 1
+  CARGO_HTTP_CHECK_REVOKE: false
+
   matrix:
-  - TARGET: x86_64-pc-windows-gnu
-    BITS: 64
-    CFG_DISABLE_CROSS_TESTS: 1
-    MAKE_TARGETS: test-unit-x86_64-pc-windows-gnu
-  - TARGET: i686-pc-windows-gnu
-    BITS: 32
-    MINGW_URL: https://s3.amazonaws.com/rust-lang-ci
-    MINGW_ARCHIVE: i686-4.9.2-release-win32-dwarf-rt_v4-rev4.7z
-    MINGW_DIR: mingw32
-    CFG_DISABLE_CROSS_TESTS: 1
-    MAKE_TARGETS: test-unit-i686-pc-windows-gnu
-  - TARGET: i686-pc-windows-msvc
-    BITS: 32
-    MAKE_TARGETS: test-unit-i686-pc-windows-msvc
-    CFG_DISABLE_CROSS_TESTS: 1
-    ALLOW_PR: 1
   - TARGET: x86_64-pc-windows-msvc
     OTHER_TARGET: i686-pc-windows-msvc
-    BITS: 64
     MAKE_TARGETS: test-unit-x86_64-pc-windows-msvc
 
 install:
-  - set PATH=C:\msys64\mingw%BITS%\bin;C:\msys64\usr\bin;%PATH%
-  - if defined MINGW_URL appveyor DownloadFile %MINGW_URL%/%MINGW_ARCHIVE%
-  - if defined MINGW_URL 7z x -y %MINGW_ARCHIVE% > nul
-  - if defined MINGW_URL set PATH=%CD%\%MINGW_DIR%\bin;C:\msys64\usr\bin;%PATH%
-
-  # FIXME(#3394) use master rustup
-  - curl -sSfO https://static.rust-lang.org/rustup/archive/0.6.5/x86_64-pc-windows-msvc/rustup-init.exe
-  - rustup-init.exe -y --default-host x86_64-pc-windows-msvc --default-toolchain nightly-2017-03-03
+  - appveyor-retry appveyor DownloadFile https://win.rustup.rs/ -FileName rustup-init.exe
+  - rustup-init.exe -y --default-host x86_64-pc-windows-msvc --default-toolchain nightly
   - set PATH=%PATH%;C:\Users\appveyor\.cargo\bin
-  - if NOT "%TARGET%" == "x86_64-pc-windows-msvc" rustup target add %TARGET%
-  - if defined OTHER_TARGET rustup target add %OTHER_TARGET%
+  - rustup target add %OTHER_TARGET%
   - rustc -V
   - cargo -V
   - git submodule update --init
@@ -43,29 +38,4 @@ clone_depth: 1
 build: false
 
 test_script:
-  - sh src/ci/run.sh %TARGET%
-
-before_deploy:
-  - ps: |
-        New-Item -Path deploy -ItemType directory
-        Get-ChildItem -Path target\${env:TARGET}\release\dist -Filter '*.tar.gz' | Move-Item -Destination deploy
-        Get-FileHash .\deploy\* | ForEach-Object {
-          [io.file]::WriteAllText($_.Path + ".sha256", $_.Hash.ToLower() + "`n")
-        }
-        Get-ChildItem -Path deploy | Foreach-Object {
-          Push-AppveyorArtifact $_.FullName -FileName ${env:APPVEYOR_REPO_COMMIT}/$_
-        }
-
-deploy:
-  - provider: S3
-    skip_cleanup: true
-    access_key_id: AKIAIWZDM2B2IJOWBGTA
-    secret_access_key:
-      secure: hyH54di5NyNdV+jjntM1dRN/NeUgDidwZmwcg4/UKpdJqGf1AAwYb2ulXYK67CXA
-    bucket: rust-lang-ci
-    set_public: true
-    region: us-east-1
-    folder: cargo-builds
-    artifact: /.*\.(tar.gz|sha256)/
-    on:
-      branch: auto-cargo
+  - cargo test

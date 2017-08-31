@@ -1,7 +1,7 @@
 use std::cmp::{self, Ordering};
 use std::collections::hash_map::{HashMap, Values, IterMut};
 use std::fmt::{self, Formatter};
-use std::hash;
+use std::hash::{self, Hash};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, ATOMIC_BOOL_INIT};
@@ -16,7 +16,7 @@ use ops;
 use sources::git;
 use sources::{PathSource, GitSource, RegistrySource, CRATES_IO};
 use sources::DirectorySource;
-use util::{human, Config, CargoResult, ToUrl};
+use util::{Config, CargoResult, ToUrl};
 
 /// A Source finds and downloads remote packages based on names and
 /// versions.
@@ -114,15 +114,16 @@ struct SourceIdInner {
 }
 
 impl SourceId {
-    fn new(kind: Kind, url: Url) -> SourceId {
-        SourceId {
+    fn new(kind: Kind, url: Url) -> CargoResult<SourceId> {
+        let source_id = SourceId {
             inner: Arc::new(SourceIdInner {
                 kind: kind,
-                canonical_url: git::canonicalize_url(&url),
+                canonical_url: git::canonicalize_url(&url)?,
                 url: url,
                 precise: None,
             }),
-        }
+        };
+        Ok(source_id)
     }
 
     /// Parses a source URL and returns the corresponding ID.
@@ -138,7 +139,7 @@ impl SourceId {
     pub fn from_url(string: &str) -> CargoResult<SourceId> {
         let mut parts = string.splitn(2, '+');
         let kind = parts.next().unwrap();
-        let url = parts.next().ok_or(human(format!("invalid source `{}`", string)))?;
+        let url = parts.next().ok_or_else(|| format!("invalid source `{}`", string))?;
 
         match kind {
             "git" => {
@@ -158,73 +159,47 @@ impl SourceId {
                 let precise = url.fragment().map(|s| s.to_owned());
                 url.set_fragment(None);
                 url.set_query(None);
-                Ok(SourceId::for_git(&url, reference).with_precise(precise))
+                Ok(SourceId::for_git(&url, reference)?.with_precise(precise))
             },
             "registry" => {
                 let url = url.to_url()?;
-                Ok(SourceId::new(Kind::Registry, url)
+                Ok(SourceId::new(Kind::Registry, url)?
                             .with_precise(Some("locked".to_string())))
             }
             "path" => {
                 let url = url.to_url()?;
-                Ok(SourceId::new(Kind::Path, url))
+                SourceId::new(Kind::Path, url)
             }
-            kind => Err(human(format!("unsupported source protocol: {}", kind)))
+            kind => Err(format!("unsupported source protocol: {}", kind).into())
         }
     }
 
-    pub fn to_url(&self) -> String {
-        match *self.inner {
-            SourceIdInner { kind: Kind::Path, ref url, .. } => {
-                format!("path+{}", url)
-            }
-            SourceIdInner {
-                kind: Kind::Git(ref reference), ref url, ref precise, ..
-            } => {
-                let ref_str = reference.url_ref();
-
-                let precise_str = if precise.is_some() {
-                    format!("#{}", precise.as_ref().unwrap())
-                } else {
-                    "".to_string()
-                };
-
-                format!("git+{}{}{}", url, ref_str, precise_str)
-            }
-            SourceIdInner { kind: Kind::Registry, ref url, .. } => {
-                format!("registry+{}", url)
-            }
-            SourceIdInner { kind: Kind::LocalRegistry, ref url, .. } => {
-                format!("local-registry+{}", url)
-            }
-            SourceIdInner { kind: Kind::Directory, ref url, .. } => {
-                format!("directory+{}", url)
-            }
-        }
+    pub fn to_url(&self) -> SourceIdToUrl {
+        SourceIdToUrl { inner: &*self.inner }
     }
 
     // Pass absolute path
     pub fn for_path(path: &Path) -> CargoResult<SourceId> {
         let url = path.to_url()?;
-        Ok(SourceId::new(Kind::Path, url))
+        SourceId::new(Kind::Path, url)
     }
 
-    pub fn for_git(url: &Url, reference: GitReference) -> SourceId {
+    pub fn for_git(url: &Url, reference: GitReference) -> CargoResult<SourceId> {
         SourceId::new(Kind::Git(reference), url.clone())
     }
 
-    pub fn for_registry(url: &Url) -> SourceId {
+    pub fn for_registry(url: &Url) -> CargoResult<SourceId> {
         SourceId::new(Kind::Registry, url.clone())
     }
 
     pub fn for_local_registry(path: &Path) -> CargoResult<SourceId> {
         let url = path.to_url()?;
-        Ok(SourceId::new(Kind::LocalRegistry, url))
+        SourceId::new(Kind::LocalRegistry, url)
     }
 
     pub fn for_directory(path: &Path) -> CargoResult<SourceId> {
         let url = path.to_url()?;
-        Ok(SourceId::new(Kind::Directory, url))
+        SourceId::new(Kind::Directory, url)
     }
 
     /// Returns the `SourceId` corresponding to the main repository.
@@ -246,7 +221,7 @@ impl SourceId {
             CRATES_IO
         };
         let url = url.to_url()?;
-        Ok(SourceId::for_registry(&url))
+        SourceId::for_registry(&url)
     }
 
     pub fn url(&self) -> &Url {
@@ -267,31 +242,31 @@ impl SourceId {
     }
 
     /// Creates an implementation of `Source` corresponding to this ID.
-    pub fn load<'a>(&self, config: &'a Config) -> Box<Source + 'a> {
+    pub fn load<'a>(&self, config: &'a Config) -> CargoResult<Box<Source + 'a>> {
         trace!("loading SourceId; {}", self);
         match self.inner.kind {
-            Kind::Git(..) => Box::new(GitSource::new(self, config)),
+            Kind::Git(..) => Ok(Box::new(GitSource::new(self, config)?)),
             Kind::Path => {
                 let path = match self.inner.url.to_file_path() {
                     Ok(p) => p,
                     Err(()) => panic!("path sources cannot be remote"),
                 };
-                Box::new(PathSource::new(&path, self, config))
+                Ok(Box::new(PathSource::new(&path, self, config)))
             }
-            Kind::Registry => Box::new(RegistrySource::remote(self, config)),
+            Kind::Registry => Ok(Box::new(RegistrySource::remote(self, config))),
             Kind::LocalRegistry => {
                 let path = match self.inner.url.to_file_path() {
                     Ok(p) => p,
                     Err(()) => panic!("path sources cannot be remote"),
                 };
-                Box::new(RegistrySource::local(self, &path, config))
+                Ok(Box::new(RegistrySource::local(self, &path, config)))
             }
             Kind::Directory => {
                 let path = match self.inner.url.to_file_path() {
                     Ok(p) => p,
                     Err(()) => panic!("path sources cannot be remote"),
                 };
-                Box::new(DirectorySource::new(&path, self, config))
+                Ok(Box::new(DirectorySource::new(&path, self, config)))
             }
         }
     }
@@ -323,6 +298,17 @@ impl SourceId {
         }
         self.inner.url.to_string() == CRATES_IO
     }
+
+    pub fn stable_hash<S: hash::Hasher>(&self, workspace: &Path, into: &mut S) {
+        if self.is_path() {
+            if let Ok(p) = self.inner.url.to_file_path().unwrap().strip_prefix(workspace) {
+                self.inner.kind.hash(into);
+                p.to_str().unwrap().hash(into);
+                return
+            }
+        }
+        self.hash(into)
+    }
 }
 
 impl PartialEq for SourceId {
@@ -350,7 +336,7 @@ impl ser::Serialize for SourceId {
         if self.is_path() {
             None::<String>.serialize(s)
         } else {
-            Some(self.to_url()).serialize(s)
+            s.collect_str(&self.to_url())
         }
     }
 }
@@ -372,7 +358,10 @@ impl fmt::Display for SourceId {
             }
             SourceIdInner { kind: Kind::Git(ref reference), ref url,
                             ref precise, .. } => {
-                write!(f, "{}{}", url, reference.url_ref())?;
+                write!(f, "{}", url)?;
+                if let Some(pretty) = reference.pretty_ref() {
+                    write!(f, "?{}", pretty)?;
+                }
 
                 if let Some(ref s) = *precise {
                     let len = cmp::min(s.len(), 8);
@@ -440,7 +429,7 @@ impl Ord for SourceIdInner {
 // The hash of SourceId is used in the name of some Cargo folders, so shouldn't
 // vary. `as_str` gives the serialisation of a url (which has a spec) and so
 // insulates against possible changes in how the url crate does hashing.
-impl hash::Hash for SourceId {
+impl Hash for SourceId {
     fn hash<S: hash::Hasher>(&self, into: &mut S) {
         self.inner.kind.hash(into);
         match *self.inner {
@@ -452,25 +441,60 @@ impl hash::Hash for SourceId {
     }
 }
 
-impl GitReference {
-    pub fn to_ref_string(&self) -> Option<String> {
-        match *self {
-            GitReference::Branch(ref s) => {
-                if *s == "master" {
-                    None
-                } else {
-                    Some(format!("branch={}", s))
-                }
+pub struct SourceIdToUrl<'a> {
+    inner: &'a SourceIdInner,
+}
+
+impl<'a> fmt::Display for SourceIdToUrl<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self.inner {
+            SourceIdInner { kind: Kind::Path, ref url, .. } => {
+                write!(f, "path+{}", url)
             }
-            GitReference::Tag(ref s) => Some(format!("tag={}", s)),
-            GitReference::Rev(ref s) => Some(format!("rev={}", s)),
+            SourceIdInner {
+                kind: Kind::Git(ref reference), ref url, ref precise, ..
+            } => {
+                write!(f, "git+{}", url)?;
+                if let Some(pretty) = reference.pretty_ref() {
+                    write!(f, "?{}", pretty)?;
+                }
+                if let Some(precise) = precise.as_ref() {
+                    write!(f, "#{}", precise)?;
+                }
+                Ok(())
+            }
+            SourceIdInner { kind: Kind::Registry, ref url, .. } => {
+                write!(f, "registry+{}", url)
+            }
+            SourceIdInner { kind: Kind::LocalRegistry, ref url, .. } => {
+                write!(f, "local-registry+{}", url)
+            }
+            SourceIdInner { kind: Kind::Directory, ref url, .. } => {
+                write!(f, "directory+{}", url)
+            }
         }
     }
+}
 
-    fn url_ref(&self) -> String {
-        match self.to_ref_string() {
-            None => "".to_string(),
-            Some(s) => format!("?{}", s),
+impl GitReference {
+    pub fn pretty_ref(&self) -> Option<PrettyRef> {
+        match *self {
+            GitReference::Branch(ref s) if *s == "master" => None,
+            _ => Some(PrettyRef { inner: self }),
+        }
+    }
+}
+
+pub struct PrettyRef<'a> {
+    inner: &'a GitReference,
+}
+
+impl<'a> fmt::Display for PrettyRef<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self.inner {
+            GitReference::Branch(ref b) => write!(f, "branch={}", b),
+            GitReference::Tag(ref s) => write!(f, "tag={}", s),
+            GitReference::Rev(ref s) => write!(f, "rev={}", s),
         }
     }
 }
@@ -552,15 +576,15 @@ mod tests {
     fn github_sources_equal() {
         let loc = "https://github.com/foo/bar".to_url().unwrap();
         let master = Kind::Git(GitReference::Branch("master".to_string()));
-        let s1 = SourceId::new(master.clone(), loc);
+        let s1 = SourceId::new(master.clone(), loc).unwrap();
 
         let loc = "git://github.com/foo/bar".to_url().unwrap();
-        let s2 = SourceId::new(master, loc.clone());
+        let s2 = SourceId::new(master, loc.clone()).unwrap();
 
         assert_eq!(s1, s2);
 
         let foo = Kind::Git(GitReference::Branch("foo".to_string()));
-        let s3 = SourceId::new(foo, loc);
+        let s3 = SourceId::new(foo, loc).unwrap();
         assert!(s1 != s3);
     }
 }

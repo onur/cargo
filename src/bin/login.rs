@@ -4,9 +4,9 @@ use std::io;
 use cargo::ops;
 use cargo::core::{SourceId, Source};
 use cargo::sources::RegistrySource;
-use cargo::util::{CliResult, Config, human, ChainError};
+use cargo::util::{CliResult, CargoResultExt, Config};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options {
     flag_host: Option<String>,
     arg_token: Option<String>,
@@ -15,6 +15,8 @@ pub struct Options {
     flag_color: Option<String>,
     flag_frozen: bool,
     flag_locked: bool,
+    #[serde(rename = "flag_Z")]
+    flag_z: Vec<String>,
 }
 
 pub const USAGE: &'static str = "
@@ -31,6 +33,7 @@ Options:
     --color WHEN             Coloring: auto, always, never
     --frozen                 Require Cargo.lock and cache are up to date
     --locked                 Require Cargo.lock is up to date
+    -Z FLAG ...              Unstable (nightly-only) flags to Cargo
 
 ";
 
@@ -39,7 +42,8 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
                      options.flag_quiet,
                      &options.flag_color,
                      options.flag_frozen,
-                     options.flag_locked)?;
+                     options.flag_locked,
+                     &options.flag_z)?;
     let token = match options.arg_token.clone() {
         Some(token) => token,
         None => {
@@ -51,8 +55,8 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
             println!("please visit {}me and paste the API Token below", host);
             let mut line = String::new();
             let input = io::stdin();
-            input.lock().read_line(&mut line).chain_error(|| {
-                human("failed to read stdin")
+            input.lock().read_line(&mut line).chain_err(|| {
+                "failed to read stdin"
             })?;
             line
         }

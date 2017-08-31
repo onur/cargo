@@ -33,8 +33,10 @@ use core::resolver::Resolve;
 use ops::{self, BuildOutput, Executor, DefaultExecutor};
 use util::config::Config;
 use util::{CargoResult, profile};
+use util::errors::{CargoResultExt, CargoError};
 
 /// Contains information about how a package should be compiled.
+#[derive(Debug)]
 pub struct CompileOptions<'a> {
     pub config: &'a Config,
     /// Number of concurrent jobs to use.
@@ -78,7 +80,7 @@ impl<'a> CompileOptions<'a> {
             spec: ops::Packages::Packages(&[]),
             mode: mode,
             release: false,
-            filter: CompileFilter::Everything { required_features_filterable: false },
+            filter: CompileFilter::Default { required_features_filterable: false },
             message_format: MessageFormat::Human,
             target_rustdoc_args: None,
             target_rustc_args: None,
@@ -96,7 +98,7 @@ pub enum CompileMode {
     Doctest,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, RustcDecodable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum MessageFormat {
     Human,
     Json
@@ -105,16 +107,40 @@ pub enum MessageFormat {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Packages<'a> {
     All,
+    OptOut(&'a [String]),
     Packages(&'a [String]),
 }
 
 impl<'a> Packages<'a> {
+    pub fn from_flags(virtual_ws: bool, all: bool, exclude: &'a Vec<String>, package: &'a Vec<String>)
+        -> CargoResult<Self>
+    {
+        let all = all || (virtual_ws && package.is_empty());
+
+        let packages = match (all, &exclude) {
+            (true, exclude) if exclude.is_empty() => Packages::All,
+            (true, exclude) => Packages::OptOut(exclude),
+            (false, exclude) if !exclude.is_empty() => bail!("--exclude can only be used together \
+                                                           with --all"),
+            _ => Packages::Packages(package),
+        };
+
+        Ok(packages)
+    }
+
     pub fn into_package_id_specs(self, ws: &Workspace) -> CargoResult<Vec<PackageIdSpec>> {
         let specs = match self {
             Packages::All => {
                 ws.members()
                     .map(Package::package_id)
                     .map(PackageIdSpec::from_package_id)
+                    .collect()
+            }
+            Packages::OptOut(opt_out) => {
+                ws.members()
+                    .map(Package::package_id)
+                    .map(PackageIdSpec::from_package_id)
+                    .filter(|p| opt_out.iter().position(|x| *x == p.name()).is_none())
                     .collect()
             }
             Packages::Packages(packages) => {
@@ -125,14 +151,15 @@ impl<'a> Packages<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum FilterRule<'a> {
     All,
     Just (&'a [String]),
 }
 
+#[derive(Debug)]
 pub enum CompileFilter<'a> {
-    Everything {
+    Default {
         /// Flag whether targets can be safely skipped when required-features are not satisfied.
         required_features_filterable: bool,
     },
@@ -155,8 +182,15 @@ pub fn compile_with_exec<'a>(ws: &Workspace<'a>,
                              exec: Arc<Executor>)
                              -> CargoResult<ops::Compilation<'a>> {
     for member in ws.members() {
-        for key in member.manifest().warnings().iter() {
-            options.config.shell().warn(key)?
+        for warning in member.manifest().warnings().iter() {
+            if warning.is_critical {
+                let err: CargoResult<_> = Err(CargoError::from(warning.message.to_owned()));
+                return err.chain_err(|| {
+                    format!("failed to parse manifest at `{}`", member.manifest_path().display())
+                })
+            } else {
+                options.config.shell().warn(&warning.message)?
+            }
         }
     }
     compile_ws(ws, None, options, exec)
@@ -198,6 +232,7 @@ pub fn compile_ws<'a>(ws: &Workspace<'a>,
         }
     } else {
         let root_package = ws.current()?;
+        root_package.manifest().print_teapot(ws.config());
         let all_features = resolve_all_features(&resolve_with_overrides,
                                                 root_package.package_id());
         generate_targets(root_package, profiles, mode, filter, &all_features, release)?;
@@ -345,13 +380,20 @@ impl<'a> CompileFilter<'a> {
                bins: &'a [String], all_bins: bool,
                tsts: &'a [String], all_tsts: bool,
                exms: &'a [String], all_exms: bool,
-               bens: &'a [String], all_bens: bool) -> CompileFilter<'a> {
+               bens: &'a [String], all_bens: bool,
+               all_targets: bool) -> CompileFilter<'a> {
         let rule_bins = FilterRule::new(bins, all_bins);
         let rule_tsts = FilterRule::new(tsts, all_tsts);
         let rule_exms = FilterRule::new(exms, all_exms);
         let rule_bens = FilterRule::new(bens, all_bens);
 
-        if lib_only || rule_bins.is_specific() || rule_tsts.is_specific()
+        if all_targets {
+            CompileFilter::Only {
+                lib: true, bins: FilterRule::All,
+                examples: FilterRule::All, benches: FilterRule::All,
+                tests: FilterRule::All,
+            }
+        } else if lib_only || rule_bins.is_specific() || rule_tsts.is_specific()
                     || rule_exms.is_specific() || rule_bens.is_specific() {
             CompileFilter::Only {
                 lib: lib_only, bins: rule_bins,
@@ -359,7 +401,7 @@ impl<'a> CompileFilter<'a> {
                 tests: rule_tsts,
             }
         } else {
-            CompileFilter::Everything {
+            CompileFilter::Default {
                 required_features_filterable: true,
             }
         }
@@ -367,7 +409,7 @@ impl<'a> CompileFilter<'a> {
 
     pub fn matches(&self, target: &Target) -> bool {
         match *self {
-            CompileFilter::Everything { .. } => true,
+            CompileFilter::Default { .. } => true,
             CompileFilter::Only { lib, bins, examples, tests, benches } => {
                 let rule = match *target.kind() {
                     TargetKind::Bin => bins,
@@ -385,7 +427,7 @@ impl<'a> CompileFilter<'a> {
 
     pub fn is_specific(&self) -> bool {
         match *self {
-            CompileFilter::Everything { .. } => false,
+            CompileFilter::Default { .. } => false,
             CompileFilter::Only { .. } => true,
         }
     }
@@ -567,7 +609,7 @@ fn generate_targets<'a>(pkg: &'a Package,
     };
 
     let targets = match *filter {
-        CompileFilter::Everything { required_features_filterable } => {
+        CompileFilter::Default { required_features_filterable } => {
             let deps = if release {
                 &profiles.bench_deps
             } else {
@@ -617,6 +659,11 @@ fn scrape_build_config(config: &Config,
                        jobs: Option<u32>,
                        target: Option<String>)
                        -> CargoResult<ops::BuildConfig> {
+    if jobs.is_some() && config.jobserver_from_env().is_some() {
+        config.shell().warn("a `-j` argument was passed to Cargo but Cargo is \
+                             also configured with an external jobserver in \
+                             its environment, ignoring the `-j` parameter")?;
+    }
     let cfg_jobs = match config.get_i64("build.jobs")? {
         Some(v) => {
             if v.val <= 0 {
@@ -662,16 +709,21 @@ fn scrape_target_config(config: &Config, triple: &str)
         None => return Ok(ret),
     };
     for (lib_name, value) in table {
-        if lib_name == "ar" || lib_name == "linker" || lib_name == "rustflags" {
-            continue
+        match lib_name.as_str() {
+            "ar" | "linker" | "runner" | "rustflags" => {
+                continue
+            },
+            _ => {}
         }
 
         let mut output = BuildOutput {
             library_paths: Vec::new(),
             library_links: Vec::new(),
             cfgs: Vec::new(),
+            env: Vec::new(),
             metadata: Vec::new(),
             rerun_if_changed: Vec::new(),
+            rerun_if_env_changed: Vec::new(),
             warnings: Vec::new(),
         };
         // We require deterministic order of evaluation, so we must sort the pairs by key first.
@@ -708,7 +760,15 @@ fn scrape_target_config(config: &Config, triple: &str)
                     let list = value.list(&k)?;
                     output.cfgs.extend(list.iter().map(|v| v.0.clone()));
                 }
-                "warning" | "rerun-if-changed" => {
+                "rustc-env" => {
+                    for (name, val) in value.table(&k)?.0 {
+                        let val = val.string(name)?.0;
+                        output.env.push((name.clone(), val.to_string()));
+                    }
+                }
+                "warning" |
+                "rerun-if-changed" |
+                "rerun-if-env-changed" => {
                     bail!("`{}` is not supported in build script overrides", k);
                 }
                 _ => {

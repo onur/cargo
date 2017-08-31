@@ -3,17 +3,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::slice;
 
+use glob::glob;
+use url::Url;
+
 use core::{Package, VirtualManifest, EitherManifest, SourceId};
 use core::{PackageIdSpec, Dependency, Profile, Profiles};
-use ops;
-use util::{Config, CargoResult, Filesystem, human};
+use util::{Config, Filesystem};
+use util::errors::{CargoResult, CargoResultExt};
 use util::paths;
+use util::toml::read_manifest;
 
 /// The core abstraction in Cargo for working with a workspace of crates.
 ///
 /// A workspace is often created very early on and then threaded through all
 /// other functions. It's typically through this object that the current
 /// package is loaded and/or learned about.
+#[derive(Debug)]
 pub struct Workspace<'cfg> {
     config: &'cfg Config,
 
@@ -53,11 +58,13 @@ pub struct Workspace<'cfg> {
 
 // Separate structure for tracking loaded packages (to avoid loading anything
 // twice), and this is separate to help appease the borrow checker.
+#[derive(Debug)]
 struct Packages<'cfg> {
     config: &'cfg Config,
     packages: HashMap<PathBuf, MaybePackage>,
 }
 
+#[derive(Debug)]
 enum MaybePackage {
     Package(Package),
     Virtual(VirtualManifest),
@@ -124,7 +131,9 @@ impl<'cfg> Workspace<'cfg> {
     ///
     /// This is currently only used in niche situations like `cargo install` or
     /// `cargo package`.
-    pub fn ephemeral(package: Package, config: &'cfg Config, target_dir: Option<Filesystem>,
+    pub fn ephemeral(package: Package,
+                     config: &'cfg Config,
+                     target_dir: Option<Filesystem>,
                      require_optional_deps: bool) -> CargoResult<Workspace<'cfg>> {
         let mut ws = Workspace {
             config: config,
@@ -160,9 +169,9 @@ impl<'cfg> Workspace<'cfg> {
     /// indicating that something else should be passed.
     pub fn current(&self) -> CargoResult<&Package> {
         self.current_opt().ok_or_else(||
-            human(format!("manifest path `{}` is a virtual manifest, but this \
-                           command requires running against an actual package in \
-                           this workspace", self.current_manifest.display()))
+            format!("manifest path `{}` is a virtual manifest, but this \
+                     command requires running against an actual package in \
+                     this workspace", self.current_manifest.display()).into()
         )
     }
 
@@ -170,6 +179,13 @@ impl<'cfg> Workspace<'cfg> {
         match *self.packages.get(&self.current_manifest) {
             MaybePackage::Package(ref p) => Some(p),
             MaybePackage::Virtual(..) => None
+        }
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        match *self.packages.get(&self.current_manifest) {
+            MaybePackage::Package(..) => false,
+            MaybePackage::Virtual(..) => true
         }
     }
 
@@ -214,6 +230,20 @@ impl<'cfg> Workspace<'cfg> {
         match *self.packages.get(path) {
             MaybePackage::Package(ref p) => p.manifest().replace(),
             MaybePackage::Virtual(ref v) => v.replace(),
+        }
+    }
+
+    /// Returns the root [patch] section of this workspace.
+    ///
+    /// This may be from a virtual crate or an actual crate.
+    pub fn root_patch(&self) -> &HashMap<Url, Vec<Dependency>> {
+        let path = match self.root_manifest {
+            Some(ref p) => p,
+            None => &self.current_manifest,
+        };
+        match *self.packages.get(path) {
+            MaybePackage::Package(ref p) => p.manifest().patch(),
+            MaybePackage::Virtual(ref v) => v.patch(),
         }
     }
 
@@ -316,9 +346,24 @@ impl<'cfg> Workspace<'cfg> {
         };
 
         if let Some(list) = members {
+            let root = root_manifest.parent().unwrap();
+
+            let mut expanded_list = Vec::new();
             for path in list {
-                let root = root_manifest.parent().unwrap();
-                let manifest_path = root.join(path).join("Cargo.toml");
+                let pathbuf = root.join(path);
+                let expanded_paths = expand_member_path(&pathbuf)?;
+
+                // If glob does not find any valid paths, then put the original
+                // path in the expanded list to maintain backwards compatibility.
+                if expanded_paths.is_empty() {
+                    expanded_list.push(pathbuf);
+                } else {
+                    expanded_list.extend(expanded_paths);
+                }
+            }
+
+            for path in expanded_list {
+                let manifest_path = path.join("Cargo.toml");
                 self.find_path_deps(&manifest_path, &root_manifest, false)?;
             }
         }
@@ -527,6 +572,21 @@ impl<'cfg> Workspace<'cfg> {
     }
 }
 
+fn expand_member_path(path: &Path) -> CargoResult<Vec<PathBuf>> {
+    let path = match path.to_str() {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+    let res = glob(path).chain_err(|| {
+        format!("could not parse pattern `{}`", &path)
+    })?;
+    res.map(|p| {
+        p.chain_err(|| {
+            format!("unable to match path to pattern `{}`", &path)
+        })
+    }).collect()
+}
+
 fn is_excluded(members: &Option<Vec<String>>,
                exclude: &[String],
                root_path: &Path,
@@ -559,9 +619,8 @@ impl<'cfg> Packages<'cfg> {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(v) => {
                 let source_id = SourceId::for_path(key)?;
-                let pair = ops::read_manifest(&manifest_path, &source_id,
-                                              self.config)?;
-                let (manifest, _nested_paths) = pair;
+                let (manifest, _nested_paths) =
+                    read_manifest(&manifest_path, &source_id, self.config)?;
                 Ok(v.insert(match manifest {
                     EitherManifest::Real(manifest) => {
                         MaybePackage::Package(Package::new(manifest,

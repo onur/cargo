@@ -1,22 +1,24 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::collections::BTreeMap;
 
-use rustc_serialize::{Decodable, Decoder};
+use serde::{Deserialize, Deserializer};
+use serde::de;
 
 use git2::Config as GitConfig;
-
-use term::color::BLACK;
+use git2::Repository as GitRepository;
 
 use core::Workspace;
-use util::{GitRepo, HgRepo, PijulRepo, CargoResult, human, ChainError, internal};
+use ops::is_bad_artifact_name;
+use util::{GitRepo, HgRepo, PijulRepo, FossilRepo, internal};
 use util::{Config, paths};
+use util::errors::{CargoError, CargoResult, CargoResultExt};
 
 use toml;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum VersionControl { Git, Hg, Pijul, NoVcs }
+pub enum VersionControl { Git, Hg, Pijul, Fossil, NoVcs }
 
 pub struct NewOptions<'a> {
     pub version_control: Option<VersionControl>,
@@ -40,16 +42,18 @@ struct MkOptions<'a> {
     bin: bool,
 }
 
-impl Decodable for VersionControl {
-    fn decode<D: Decoder>(d: &mut D) -> Result<VersionControl, D::Error> {
-        Ok(match &d.read_str()?[..] {
+impl<'de> Deserialize<'de> for VersionControl {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<VersionControl, D::Error> {
+        Ok(match &String::deserialize(d)?[..] {
             "git" => VersionControl::Git,
             "hg" => VersionControl::Hg,
             "pijul" => VersionControl::Pijul,
+            "fossil" => VersionControl::Fossil,
             "none" => VersionControl::NoVcs,
             n => {
-                let err = format!("could not decode '{}' as version control", n);
-                return Err(d.error(&err));
+                let value = de::Unexpected::Str(n);
+                let msg = "unsupported version control system";
+                return Err(de::Error::invalid_value(value, &msg));
             }
         })
     }
@@ -96,9 +100,9 @@ fn get_name<'a>(path: &'a Path, opts: &'a NewOptions, config: &Config) -> CargoR
                               path.as_os_str());
     }
 
-    let dir_name = path.file_name().and_then(|s| s.to_str()).chain_error(|| {
-        human(&format!("cannot create a project with a non-unicode name: {:?}",
-                       path.file_name().unwrap()))
+    let dir_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        CargoError::from(format!("cannot create a project with a non-unicode name: {:?}",
+                                 path.file_name().unwrap()))
     })?;
 
     if opts.bin {
@@ -106,16 +110,15 @@ fn get_name<'a>(path: &'a Path, opts: &'a NewOptions, config: &Config) -> CargoR
     } else {
         let new_name = strip_rust_affixes(dir_name);
         if new_name != dir_name {
-            let message = format!(
-                "note: package will be named `{}`; use --name to override",
-                new_name);
-            config.shell().say(&message, BLACK)?;
+            writeln!(config.shell().err(),
+                     "note: package will be named `{}`; use --name to override",
+                     new_name)?;
         }
         Ok(new_name)
     }
 }
 
-fn check_name(name: &str) -> CargoResult<()> {
+fn check_name(name: &str, is_bin: bool) -> CargoResult<()> {
 
     // Ban keywords + test list found at
     // https://doc.rust-lang.org/grammar.html#keywords
@@ -130,7 +133,7 @@ fn check_name(name: &str) -> CargoResult<()> {
         "super", "test", "trait", "true", "type", "typeof",
         "unsafe", "unsized", "use", "virtual", "where",
         "while", "yield"];
-    if blacklist.contains(&name) {
+    if blacklist.contains(&name) || (is_bin && is_bad_artifact_name(name)) {
         bail!("The name `{}` cannot be used as a crate name\n\
                use --name to override crate name",
                name)
@@ -234,10 +237,10 @@ cannot automatically generate Cargo.toml as the main target would be ambiguous",
             duplicates_checker.insert(i.target_name.as_ref(), i);
         } else {
             if let Some(plp) = previous_lib_relpath {
-                return Err(human(format!("cannot have a project with \
-                                         multiple libraries, \
-                                         found both `{}` and `{}`",
-                                         plp, i.relative_path)));
+                return Err(format!("cannot have a project with \
+                                    multiple libraries, \
+                                    found both `{}` and `{}`",
+                                   plp, i.relative_path).into());
             }
             previous_lib_relpath = Some(&i.relative_path);
         }
@@ -265,16 +268,18 @@ fn plan_new_source_file(bin: bool, project_name: String) -> SourceFileInformatio
 pub fn new(opts: NewOptions, config: &Config) -> CargoResult<()> {
     let path = config.cwd().join(opts.path);
     if fs::metadata(&path).is_ok() {
-        bail!("destination `{}` already exists",
-              path.display())
+        bail!("destination `{}` already exists\n\n\
+            Use `cargo init` to initialize the directory\
+            ", path.display()
+        )
     }
 
     if opts.lib && opts.bin {
-        bail!("can't specify both lib and binary outputs");
+        bail!("can't specify both lib and binary outputs")
     }
 
     let name = get_name(&path, &opts, config)?;
-    check_name(name)?;
+    check_name(name, opts.bin)?;
 
     let mkopts = MkOptions {
         version_control: opts.version_control,
@@ -284,9 +289,9 @@ pub fn new(opts: NewOptions, config: &Config) -> CargoResult<()> {
         bin: opts.bin,
     };
 
-    mk(config, &mkopts).chain_error(|| {
-        human(format!("Failed to create project `{}` at `{}`",
-                      name, path.display()))
+    mk(config, &mkopts).chain_err(|| {
+        format!("Failed to create project `{}` at `{}`",
+                name, path.display())
     })
 }
 
@@ -303,7 +308,7 @@ pub fn init(opts: NewOptions, config: &Config) -> CargoResult<()> {
     }
 
     let name = get_name(&path, &opts, config)?;
-    check_name(name)?;
+    check_name(name, opts.bin)?;
 
     let mut src_paths_types = vec![];
 
@@ -337,13 +342,17 @@ pub fn init(opts: NewOptions, config: &Config) -> CargoResult<()> {
             num_detected_vsces += 1;
         }
 
+        if fs::metadata(&path.join(".fossil")).is_ok() {
+            version_control = Some(VersionControl::Fossil);
+            num_detected_vsces += 1;
+        }
+
         // if none exists, maybe create git, like in `cargo new`
 
         if num_detected_vsces > 1 {
-            bail!("more than one of .hg, .git, or .pijul directories found \
-                              and the ignore file can't be \
-                              filled in as a result, \
-                              specify --vcs to override detection");
+            bail!("more than one of .hg, .git, .pijul, .fossil configurations \
+                              found and the ignore file can't be filled in as \
+                              a result. specify --vcs to override detection");
         }
     }
 
@@ -355,9 +364,9 @@ pub fn init(opts: NewOptions, config: &Config) -> CargoResult<()> {
         source_files: src_paths_types,
     };
 
-    mk(config, &mkopts).chain_error(|| {
-        human(format!("Failed to create project `{}` at `{}`",
-                      name, path.display()))
+    mk(config, &mkopts).chain_err(|| {
+        format!("Failed to create project `{}` at `{}`",
+                 name, path.display())
     })
 }
 
@@ -383,11 +392,18 @@ fn mk(config: &Config, opts: &MkOptions) -> CargoResult<()> {
     let path = opts.path;
     let name = opts.name;
     let cfg = global_config(config)?;
-    let ignore = ["target/\n", "**/*.rs.bk\n",
+    // Please ensure that ignore and hgignore are in sync.
+    let ignore = ["/target/\n", "**/*.rs.bk\n",
         if !opts.bin { "Cargo.lock\n" } else { "" }]
         .concat();
+    // Mercurial glob ignores can't be rooted, so just sticking a 'syntax: glob' at the top of the
+    // file will exclude too much. Instead, use regexp-based ignores. See 'hg help ignore' for
+    // more.
+    let hgignore = ["^target/\n", "glob:*.rs.bk\n",
+        if !opts.bin { "glob:Cargo.lock\n" } else { "" }]
+        .concat();
 
-    let in_existing_vcs_repo = existing_vcs_repo(path.parent().unwrap(), config.cwd());
+    let in_existing_vcs_repo = existing_vcs_repo(path.parent().unwrap_or(path), config.cwd());
     let vcs = match (opts.version_control, cfg.version_control, in_existing_vcs_repo) {
         (None, None, false) => VersionControl::Git,
         (None, Some(option), false) => option,
@@ -405,11 +421,16 @@ fn mk(config: &Config, opts: &MkOptions) -> CargoResult<()> {
             if !fs::metadata(&path.join(".hg")).is_ok() {
                 HgRepo::init(path, config.cwd())?;
             }
-            paths::append(&path.join(".hgignore"), ignore.as_bytes())?;
+            paths::append(&path.join(".hgignore"), hgignore.as_bytes())?;
         },
         VersionControl::Pijul => {
             if !fs::metadata(&path.join(".pijul")).is_ok() {
                 PijulRepo::init(path, config.cwd())?;
+            }
+        },
+        VersionControl::Fossil => {
+            if !fs::metadata(&path.join(".fossil")).is_ok() {
+                FossilRepo::init(path, config.cwd())?;
             }
         },
         VersionControl::NoVcs => {
@@ -487,6 +508,7 @@ fn main() {
 mod tests {
     #[test]
     fn it_works() {
+        assert_eq!(2 + 2, 4);
     }
 }
 "
@@ -513,7 +535,12 @@ fn get_environment_variable(variables: &[&str] ) -> Option<String>{
 }
 
 fn discover_author() -> CargoResult<(String, Option<String>)> {
-    let git_config = GitConfig::open_default().ok();
+    let cwd = env::current_dir()?;
+    let git_config = if let Ok(repo) = GitRepository::discover(&cwd) {
+        repo.config().ok().or_else(|| GitConfig::open_default().ok())
+    } else {
+        GitConfig::open_default().ok()
+    };
     let git_config = git_config.as_ref();
     let name_variables = ["CARGO_NAME", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME",
                          "USER", "USERNAME", "NAME"];

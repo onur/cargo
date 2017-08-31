@@ -1,15 +1,15 @@
 use std::cmp::Ordering;
-use std::error::Error;
 use std::fmt::{self, Formatter};
 use std::hash::Hash;
 use std::hash;
+use std::path::Path;
 use std::sync::Arc;
 
 use semver;
 use serde::de;
 use serde::ser;
 
-use util::{CargoResult, CargoError, ToSemver};
+use util::{CargoResult, ToSemver};
 use core::source::SourceId;
 
 /// Identifier for a specific version of a package in a specific source.
@@ -29,10 +29,10 @@ impl ser::Serialize for PackageId {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
         where S: ser::Serializer
     {
-        let source = self.inner.source_id.to_url();
-        let encoded = format!("{} {} ({})", self.inner.name, self.inner.version,
-                              source);
-        encoded.serialize(s)
+        s.collect_str(&format_args!("{} {} ({})",
+                                    self.inner.name,
+                                    self.inner.version,
+                                    self.inner.source_id.to_url()))
     }
 }
 
@@ -96,41 +96,10 @@ impl Ord for PackageId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum PackageIdError {
-    InvalidVersion(String),
-    InvalidNamespace(String)
-}
-
-impl Error for PackageIdError {
-    fn description(&self) -> &str { "failed to parse package id" }
-}
-
-impl fmt::Display for PackageIdError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            PackageIdError::InvalidVersion(ref v) => {
-                write!(f, "invalid version: {}", *v)
-            }
-            PackageIdError::InvalidNamespace(ref ns) => {
-                write!(f, "invalid namespace: {}", *ns)
-            }
-        }
-    }
-}
-
-impl CargoError for PackageIdError {
-    fn is_human(&self) -> bool { true }
-}
-
-impl From<PackageIdError> for Box<CargoError> {
-    fn from(t: PackageIdError) -> Box<CargoError> { Box::new(t) }
-}
-
 impl PackageId {
     pub fn new<T: ToSemver>(name: &str, version: T,
                              sid: &SourceId) -> CargoResult<PackageId> {
-        let v = version.to_semver().map_err(PackageIdError::InvalidVersion)?;
+        let v = version.to_semver()?;
         Ok(PackageId {
             inner: Arc::new(PackageIdInner {
                 name: name.to_string(),
@@ -162,6 +131,20 @@ impl PackageId {
                 source_id: source.clone(),
             }),
         }
+    }
+
+    pub fn stable_hash<'a>(&'a self, workspace: &'a Path) -> PackageIdStableHash<'a> {
+        PackageIdStableHash(&self, workspace)
+    }
+}
+
+pub struct PackageIdStableHash<'a>(&'a PackageId, &'a Path);
+
+impl<'a> Hash for PackageIdStableHash<'a> {
+    fn hash<S: hash::Hasher>(&self, state: &mut S) {
+        self.0.inner.name.hash(state);
+        self.0.inner.version.hash(state);
+        self.0.inner.source_id.stable_hash(self.1, state);
     }
 }
 
@@ -197,7 +180,7 @@ mod tests {
     #[test]
     fn invalid_version_handled_nicely() {
         let loc = CRATES_IO.to_url().unwrap();
-        let repo = SourceId::for_registry(&loc);
+        let repo = SourceId::for_registry(&loc).unwrap();
 
         assert!(PackageId::new("foo", "1.0", &repo).is_err());
         assert!(PackageId::new("foo", "1", &repo).is_err());

@@ -15,7 +15,7 @@ use serde_json::{self, Value};
 use url::Url;
 use hamcrest as ham;
 use cargo::util::ProcessBuilder;
-use cargo::util::ProcessError;
+use cargo::util::{CargoError, CargoErrorKind, ProcessError};
 
 use support::paths::CargoPathExt;
 
@@ -30,6 +30,8 @@ macro_rules! t {
 pub mod paths;
 pub mod git;
 pub mod registry;
+pub mod cross_compile;
+pub mod publish;
 
 /*
  *
@@ -177,8 +179,12 @@ impl ProjectBuilder {
 
     pub fn file<B: AsRef<Path>>(mut self, path: B,
                                 body: &str) -> ProjectBuilder {
-        self.files.push(FileBuilder::new(self.root.join(path), body));
+        self._file(path.as_ref(), body);
         self
+    }
+
+    fn _file(&mut self, path: &Path, body: &str) {
+        self.files.push(FileBuilder::new(self.root.join(path), body));
     }
 
     pub fn change_file(&self, path: &str, body: &str) {
@@ -337,6 +343,7 @@ pub struct Execs {
     expect_exit_code: Option<i32>,
     expect_stdout_contains: Vec<String>,
     expect_stderr_contains: Vec<String>,
+    expect_stdout_contains_n: Vec<(String, usize)>,
     expect_stdout_not_contains: Vec<String>,
     expect_stderr_not_contains: Vec<String>,
     expect_json: Option<Vec<Value>>,
@@ -349,8 +356,12 @@ impl Execs {
     }
 
     pub fn with_stderr<S: ToString>(mut self, expected: S) -> Execs {
-        self.expect_stderr = Some(expected.to_string());
+        self._with_stderr(&expected);
         self
+    }
+
+    fn _with_stderr(&mut self, expected: &ToString) {
+        self.expect_stderr = Some(expected.to_string());
     }
 
     pub fn with_status(mut self, expected: i32) -> Execs {
@@ -365,6 +376,11 @@ impl Execs {
 
     pub fn with_stderr_contains<S: ToString>(mut self, expected: S) -> Execs {
         self.expect_stderr_contains.push(expected.to_string());
+        self
+    }
+
+    pub fn with_stdout_contains_n<S: ToString>(mut self, expected: S, number: usize) -> Execs {
+        self.expect_stdout_contains_n.push((expected.to_string(), number));
         self
     }
 
@@ -416,6 +432,10 @@ impl Execs {
             self.match_std(Some(expect), &actual.stderr, "stderr",
                            &actual.stdout, MatchKind::Partial)?;
         }
+        for &(ref expect, number) in self.expect_stdout_contains_n.iter() {
+            self.match_std(Some(&expect), &actual.stdout, "stdout",
+                           &actual.stderr, MatchKind::PartialN(number))?;
+        }
         for expect in self.expect_stdout_not_contains.iter() {
             self.match_std(Some(expect), &actual.stdout, "stdout",
                            &actual.stderr, MatchKind::NotPresent)?;
@@ -426,13 +446,12 @@ impl Execs {
         }
 
         if let Some(ref objects) = self.expect_json {
-            let lines = match str::from_utf8(&actual.stdout) {
-                Err(..) => return Err("stdout was not utf8 encoded".to_owned()),
-                Ok(stdout) => stdout.lines().collect::<Vec<_>>(),
-            };
+            let stdout = str::from_utf8(&actual.stdout)
+                .map_err(|_| "stdout was not utf8 encoded".to_owned())?;
+            let lines = stdout.lines().collect::<Vec<_>>();
             if lines.len() != objects.len() {
-                return Err(format!("expected {} json lines, got {}",
-                                   objects.len(), lines.len()));
+                return Err(format!("expected {} json lines, got {}, stdout:\n{}",
+                                   objects.len(), lines.len(), stdout));
             }
             for (obj, line) in objects.iter().zip(lines) {
                 self.match_json(obj, line)?;
@@ -491,6 +510,26 @@ impl Execs {
                                      {}\n\n\
                                      did not find in output:\n\
                                      {}", out,
+                                     actual))
+            }
+            MatchKind::PartialN(number) => {
+                let mut a = actual.lines();
+                let e = out.lines();
+
+                let mut matches = 0;
+
+                while let Some(..) = { 
+                    if self.diff_lines(a.clone(), e.clone(), true).is_empty() {
+                        matches += 1;
+                    }
+                    a.next()
+                } {}
+                
+                ham::expect(matches == number,
+                            format!("expected to find {} occurences:\n\
+                                     {}\n\n\
+                                     did not find in output:\n\
+                                     {}", number, out,
                                      actual))
             }
             MatchKind::NotPresent => {
@@ -554,6 +593,7 @@ impl Execs {
 enum MatchKind {
     Exact,
     Partial,
+    PartialN(usize),
     NotPresent,
 }
 
@@ -688,7 +728,8 @@ impl<'a> ham::Matcher<&'a mut ProcessBuilder> for Execs {
 
         match res {
             Ok(out) => self.match_output(&out),
-            Err(ProcessError { output: Some(ref out), .. }) => {
+            Err(CargoError(CargoErrorKind::ProcessErrorKind(
+                ProcessError { output: Some(ref out), .. }), ..)) => {
                 self.match_output(out)
             }
             Err(e) => {
@@ -718,6 +759,7 @@ pub fn execs() -> Execs {
         expect_exit_code: None,
         expect_stdout_contains: Vec::new(),
         expect_stderr_contains: Vec::new(),
+        expect_stdout_contains_n: Vec::new(),
         expect_stdout_not_contains: Vec::new(),
         expect_stderr_not_contains: Vec::new(),
         expect_json: None,

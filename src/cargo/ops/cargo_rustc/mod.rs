@@ -6,13 +6,15 @@ use std::io::{self, Write};
 use std::path::{self, PathBuf};
 use std::sync::Arc;
 
+use same_file::is_same_file;
 use serde_json;
 
 use core::{Package, PackageId, PackageSet, Target, Resolve};
 use core::{Profile, Profiles, Workspace};
-use core::shell::ColorConfig;
-use util::{self, CargoResult, ProcessBuilder, ProcessError, human, machine_message};
-use util::{Config, internal, ChainError, profile, join_paths, short_hash};
+use core::shell::ColorChoice;
+use util::{self, ProcessBuilder, machine_message};
+use util::{Config, internal, profile, join_paths};
+use util::errors::{CargoResult, CargoResultExt};
 use util::Freshness;
 
 use self::job::{Job, Work};
@@ -23,6 +25,7 @@ use self::output_depinfo::output_depinfo;
 pub use self::compilation::Compilation;
 pub use self::context::{Context, Unit};
 pub use self::custom_build::{BuildOutput, BuildMap, BuildScripts};
+pub use self::layout::is_bad_artifact_name;
 
 mod compilation;
 mod context;
@@ -63,10 +66,18 @@ pub type PackagesToBuild<'a> = [(&'a Package, Vec<(&'a Target, &'a Profile)>)];
 /// directly, we'll use an Executor, giving clients an opportunity to intercept
 /// the build calls.
 pub trait Executor: Send + Sync + 'static {
-    fn init(&self, _cx: &Context) {}
-    /// If execution succeeds, the ContinueBuild value indicates whether Cargo
-    /// should continue with the build process for this package.
-    fn exec(&self, cmd: ProcessBuilder, _id: &PackageId) -> Result<(), ProcessError> {
+    /// Called after a rustc process invocation is prepared up-front for a given
+    /// unit of work (may still be modified for runtime-known dependencies, when
+    /// the work is actually executed).
+    fn init(&self, _cx: &Context, _unit: &Unit) {}
+
+    /// In case of an `Err`, Cargo will not continue with the build process for
+    /// this package.
+    fn exec(&self,
+            cmd: ProcessBuilder,
+            _id: &PackageId,
+            _target: &Target)
+            -> CargoResult<()> {
         cmd.exec()?;
         Ok(())
     }
@@ -74,11 +85,18 @@ pub trait Executor: Send + Sync + 'static {
     fn exec_json(&self,
                  cmd: ProcessBuilder,
                  _id: &PackageId,
+                 _target: &Target,
                  handle_stdout: &mut FnMut(&str) -> CargoResult<()>,
                  handle_stderr: &mut FnMut(&str) -> CargoResult<()>)
-                 -> Result<(), ProcessError> {
-        cmd.exec_with_streaming(handle_stdout, handle_stderr)?;
+                 -> CargoResult<()> {
+        cmd.exec_with_streaming(handle_stdout, handle_stderr, false)?;
         Ok(())
+    }
+
+    /// Queried when queuing each unit of work. If it returns true, then the
+    /// unit will always be rebuilt, independent of whether it needs to be.
+    fn force_rebuild(&self, _unit: &Unit) -> bool {
+        false
     }
 }
 
@@ -139,23 +157,23 @@ pub fn compile_targets<'a, 'cfg: 'a>(ws: &Workspace<'cfg>,
     queue.execute(&mut cx)?;
 
     for unit in units.iter() {
-        for (dst, link_dst, _linkable) in cx.target_filenames(unit)? {
-            let bindst = match link_dst {
-                Some(link_dst) => link_dst,
-                None => dst.clone(),
+        for &(ref dst, ref link_dst, _) in cx.target_filenames(unit)?.iter() {
+            let bindst = match *link_dst {
+                Some(ref link_dst) => link_dst,
+                None => dst,
             };
 
             if unit.profile.test {
                 cx.compilation.tests.push((unit.pkg.clone(),
                                            unit.target.kind().clone(),
                                            unit.target.name().to_string(),
-                                           dst));
+                                           dst.clone()));
             } else if unit.target.is_bin() || unit.target.is_example() {
-                cx.compilation.binaries.push(bindst);
+                cx.compilation.binaries.push(bindst.clone());
             } else if unit.target.is_lib() {
                 let pkgid = unit.pkg.package_id().clone();
                 cx.compilation.libraries.entry(pkgid).or_insert(HashSet::new())
-                  .insert((unit.target.clone(), dst));
+                  .insert((unit.target.clone(), dst.clone()));
             }
         }
 
@@ -176,8 +194,8 @@ pub fn compile_targets<'a, 'cfg: 'a>(ws: &Workspace<'cfg>,
             cx.compilation.libraries
                 .entry(unit.pkg.package_id().clone())
                 .or_insert(HashSet::new())
-                .extend(v.into_iter().map(|(f, _, _)| {
-                    (dep.target.clone(), f)
+                .extend(v.iter().map(|&(ref f, _, _)| {
+                    (dep.target.clone(), f.clone())
                 }));
         }
 
@@ -193,6 +211,10 @@ pub fn compile_targets<'a, 'cfg: 'a>(ws: &Workspace<'cfg>,
         cx.compilation.cfgs.entry(pkg.clone())
             .or_insert_with(HashSet::new)
             .extend(output.cfgs.iter().cloned());
+
+        cx.compilation.extra_env.entry(pkg.clone())
+            .or_insert_with(Vec::new)
+            .extend(output.env.iter().cloned());
 
         for dir in output.library_paths.iter() {
             cx.compilation.native_dirs.insert(dir.clone());
@@ -221,9 +243,9 @@ fn compile<'a, 'cfg: 'a>(cx: &mut Context<'a, 'cfg>,
         custom_build::prepare(cx, unit)?
     } else if unit.profile.doc && unit.profile.test {
         // we run these targets later, so this is just a noop for now
-        (Work::new(|_| Ok(())), Work::new(|_| Ok(())), Freshness::Fresh)
+        (Work::noop(), Work::noop(), Freshness::Fresh)
     } else {
-        let (freshness, dirty, fresh) = fingerprint::prepare_target(cx, unit)?;
+        let (mut freshness, dirty, fresh) = fingerprint::prepare_target(cx, unit)?;
         let work = if unit.profile.doc {
             rustdoc(cx, unit)?
         } else {
@@ -232,6 +254,11 @@ fn compile<'a, 'cfg: 'a>(cx: &mut Context<'a, 'cfg>,
         // Need to link targets on both the dirty and fresh
         let dirty = work.then(link_targets(cx, unit, false)?).then(dirty);
         let fresh = link_targets(cx, unit, true)?.then(fresh);
+
+        if exec.force_rebuild(unit) {
+            freshness = Freshness::Dirty;
+        }
+
         (dirty, fresh, freshness)
     };
     jobs.enqueue(cx, unit, Job::new(dirty, fresh), freshness)?;
@@ -245,7 +272,9 @@ fn compile<'a, 'cfg: 'a>(cx: &mut Context<'a, 'cfg>,
     Ok(())
 }
 
-fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work> {
+fn rustc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>,
+                   unit: &Unit<'a>,
+                   exec: Arc<Executor>) -> CargoResult<Work> {
     let crate_types = unit.target.rustc_crate_types();
     let mut rustc = prepare_rustc(cx, crate_types, unit)?;
 
@@ -264,6 +293,7 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
 
     let filenames = cx.target_filenames(unit)?;
     let root = cx.out_dir(unit);
+    let kind = unit.kind;
 
     // Prepare the native lib state (extra -L and -l flags)
     let build_state = cx.build_state.clone();
@@ -293,8 +323,10 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
     let package_id = unit.pkg.package_id().clone();
     let target = unit.target.clone();
 
-    exec.init(cx);
+    exec.init(cx, &unit);
     let exec = exec.clone();
+
+    let root_output = cx.target_root().to_path_buf();
 
     return Ok(Work::new(move |state| {
         // Only at runtime have we discovered what the extra -L and -l
@@ -302,11 +334,15 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
         // also need to be sure to add any -L paths for our plugins to the
         // dynamic library load path as a plugin's dynamic library may be
         // located somewhere in there.
+        // Finally, if custom environment variables have been produced by
+        // previous build scripts, we include them in the rustc invocation.
         if let Some(build_deps) = build_deps {
             let build_state = build_state.outputs.lock().unwrap();
             add_native_deps(&mut rustc, &build_state, &build_deps,
                                  pass_l_flag, &current_id)?;
-            add_plugin_deps(&mut rustc, &build_state, &build_deps)?;
+            add_plugin_deps(&mut rustc, &build_state, &build_deps,
+                                 &root_output)?;
+            add_custom_env(&mut rustc, &build_state, &current_id, kind)?;
         }
 
         // FIXME(rust-lang/rust#18913): we probably shouldn't have to do
@@ -321,8 +357,8 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
             }
             for dst in &dsts {
                 if fs::metadata(dst).is_ok() {
-                    fs::remove_file(dst).chain_error(|| {
-                        human(format!("Could not remove file: {}.", dst.display()))
+                    fs::remove_file(dst).chain_err(|| {
+                        format!("Could not remove file: {}.", dst.display())
                     })?;
                 }
             }
@@ -330,7 +366,7 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
 
         state.running(&rustc);
         if json_messages {
-            exec.exec_json(rustc, &package_id,
+            exec.exec_json(rustc, &package_id, &target,
                 &mut |line| if !line.is_empty() {
                     Err(internal(&format!("compiler stdout is not empty: `{}`", line)))
                 } else {
@@ -355,12 +391,12 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
                     }
                     Ok(())
                 }
-            ).chain_error(|| {
-                human(format!("Could not compile `{}`.", name))
+            ).chain_err(|| {
+                format!("Could not compile `{}`.", name)
             })?;
         } else {
-            exec.exec(rustc, &package_id).chain_error(|| {
-                human(format!("Could not compile `{}`.", name))
+            exec.exec(rustc, &package_id, &target).map_err(|e| e.into_internal()).chain_err(|| {
+                format!("Could not compile `{}`.", name)
             })?;
         }
 
@@ -370,7 +406,7 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
                                             .to_str().unwrap()
                                             .replace(&real_name, &crate_name));
             if src.exists() && src.file_name() != dst.file_name() {
-                fs::rename(&src, &dst).chain_error(|| {
+                fs::rename(&src, &dst).chain_err(|| {
                     internal(format!("could not rename crate {:?}", src))
                 })?;
             }
@@ -378,7 +414,7 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
 
         if fs::metadata(&rustc_dep_info_loc).is_ok() {
             info!("Renaming dep_info {:?} to {:?}", rustc_dep_info_loc, dep_info_loc);
-            fs::rename(&rustc_dep_info_loc, &dep_info_loc).chain_error(|| {
+            fs::rename(&rustc_dep_info_loc, &dep_info_loc).chain_err(|| {
                 internal(format!("could not rename dep info: {:?}",
                               rustc_dep_info_loc))
             })?;
@@ -396,7 +432,7 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
                        pass_l_flag: bool,
                        current_id: &PackageId) -> CargoResult<()> {
         for key in build_scripts.to_link.iter() {
-            let output = build_state.get(key).chain_error(|| {
+            let output = build_state.get(key).ok_or_else(|| {
                 internal(format!("couldn't find build state for {}/{:?}",
                                  key.0, key.1))
             })?;
@@ -416,11 +452,28 @@ fn rustc(cx: &mut Context, unit: &Unit, exec: Arc<Executor>) -> CargoResult<Work
         }
         Ok(())
     }
+
+    // Add all custom environment variables present in `state` (after they've
+    // been put there by one of the `build_scripts`) to the command provided.
+    fn add_custom_env(rustc: &mut ProcessBuilder,
+                      build_state: &BuildMap,
+                      current_id: &PackageId,
+                      kind: Kind) -> CargoResult<()> {
+        let key = (current_id.clone(), kind);
+        if let Some(output) = build_state.get(&key) {
+            for &(ref name, ref value) in output.env.iter() {
+                rustc.env(name, value);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Link the compiled target (often of form foo-{metadata_hash}) to the
 /// final target. This must happen during both "Fresh" and "Compile"
-fn link_targets(cx: &mut Context, unit: &Unit, fresh: bool) -> CargoResult<Work> {
+fn link_targets<'a, 'cfg>(cx: &mut Context<'a, 'cfg>,
+                          unit: &Unit<'a>,
+                          fresh: bool) -> CargoResult<Work> {
     let filenames = cx.target_filenames(unit)?;
     let package_id = unit.pkg.package_id().clone();
     let target = unit.target.clone();
@@ -452,9 +505,12 @@ fn link_targets(cx: &mut Context, unit: &Unit, fresh: bool) -> CargoResult<Work>
             destinations.push(dst.display().to_string());
 
             debug!("linking {} to {}", src.display(), dst.display());
+            if is_same_file(src, dst).unwrap_or(false) {
+                continue
+            }
             if dst.exists() {
-                fs::remove_file(&dst).chain_error(|| {
-                    human(format!("failed to remove: {}", dst.display()))
+                fs::remove_file(&dst).chain_err(|| {
+                    format!("failed to remove: {}", dst.display())
                 })?;
             }
             fs::hard_link(src, dst)
@@ -462,9 +518,9 @@ fn link_targets(cx: &mut Context, unit: &Unit, fresh: bool) -> CargoResult<Work>
                      debug!("hard link failed {}. falling back to fs::copy", err);
                      fs::copy(src, dst).map(|_| ())
                  })
-                 .chain_error(|| {
-                     human(format!("failed to link or copy `{}` to `{}`",
-                                   src.display(), dst.display()))
+                 .chain_err(|| {
+                     format!("failed to link or copy `{}` to `{}`",
+                             src.display(), dst.display())
             })?;
         }
 
@@ -491,37 +547,73 @@ fn load_build_deps(cx: &Context, unit: &Unit) -> Option<Arc<BuildScripts>> {
 // execute.
 fn add_plugin_deps(rustc: &mut ProcessBuilder,
                    build_state: &BuildMap,
-                   build_scripts: &BuildScripts)
+                   build_scripts: &BuildScripts,
+                   root_output: &PathBuf)
                    -> CargoResult<()> {
     let var = util::dylib_path_envvar();
     let search_path = rustc.get_env(var).unwrap_or(OsString::new());
     let mut search_path = env::split_paths(&search_path).collect::<Vec<_>>();
     for id in build_scripts.plugins.iter() {
         let key = (id.clone(), Kind::Host);
-        let output = build_state.get(&key).chain_error(|| {
+        let output = build_state.get(&key).ok_or_else(|| {
             internal(format!("couldn't find libs for plugin dep {}", id))
         })?;
-        for path in output.library_paths.iter() {
-            search_path.push(path.clone());
-        }
+        search_path.append(&mut filter_dynamic_search_path(output.library_paths.iter(),
+                                                           root_output));
     }
     let search_path = join_paths(&search_path, var)?;
     rustc.env(var, &search_path);
     Ok(())
 }
 
-fn prepare_rustc(cx: &mut Context,
-                 crate_types: Vec<&str>,
-                 unit: &Unit) -> CargoResult<ProcessBuilder> {
+// Determine paths to add to the dynamic search path from -L entries
+//
+// Strip off prefixes like "native=" or "framework=" and filter out directories
+// *not* inside our output directory since they are likely spurious and can cause
+// clashes with system shared libraries (issue #3366).
+fn filter_dynamic_search_path<'a, I>(paths :I, root_output: &PathBuf) -> Vec<PathBuf>
+        where I: Iterator<Item=&'a PathBuf> {
+    let mut search_path = vec![];
+    for dir in paths {
+        let dir = match dir.to_str() {
+            Some(s) => {
+                let mut parts = s.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some("native"), Some(path)) |
+                    (Some("crate"), Some(path)) |
+                    (Some("dependency"), Some(path)) |
+                    (Some("framework"), Some(path)) |
+                    (Some("all"), Some(path)) => path.into(),
+                    _ => dir.clone(),
+                }
+            }
+            None => dir.clone(),
+        };
+        if dir.starts_with(&root_output) {
+            search_path.push(dir);
+        } else {
+            debug!("Not including path {} in runtime library search path because it is \
+                    outside target root {}", dir.display(), root_output.display());
+        }
+    }
+    search_path
+}
+
+fn prepare_rustc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>,
+                           crate_types: Vec<&str>,
+                           unit: &Unit<'a>) -> CargoResult<ProcessBuilder> {
     let mut base = cx.compilation.rustc_process(unit.pkg)?;
+    base.inherit_jobserver(&cx.jobserver);
     build_base_args(cx, &mut base, unit, &crate_types);
     build_deps_args(&mut base, cx, unit)?;
     Ok(base)
 }
 
 
-fn rustdoc(cx: &mut Context, unit: &Unit) -> CargoResult<Work> {
+fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>,
+                     unit: &Unit<'a>) -> CargoResult<Work> {
     let mut rustdoc = cx.compilation.rustdoc_process(unit.pkg)?;
+    rustdoc.inherit_jobserver(&cx.jobserver);
     rustdoc.arg("--crate-name").arg(&unit.target.crate_name())
            .cwd(cx.config.cwd())
            .arg(&root_path(cx, unit));
@@ -541,7 +633,7 @@ fn rustdoc(cx: &mut Context, unit: &Unit) -> CargoResult<Work> {
 
     rustdoc.arg("-o").arg(doc_dir);
 
-    for feat in cx.resolve.features(unit.pkg.package_id()) {
+    for feat in cx.resolve.features_sorted(unit.pkg.package_id()) {
         rustdoc.arg("--cfg").arg(&format!("feature=\"{}\"", feat));
     }
 
@@ -562,11 +654,12 @@ fn rustdoc(cx: &mut Context, unit: &Unit) -> CargoResult<Work> {
             for cfg in output.cfgs.iter() {
                 rustdoc.arg("--cfg").arg(cfg);
             }
+            for &(ref name, ref value) in output.env.iter() {
+                rustdoc.env(name, value);
+            }
         }
         state.running(&rustdoc);
-        rustdoc.exec().chain_error(|| {
-            human(format!("Could not document `{}`.", name))
-        })
+        rustdoc.exec().chain_err(|| format!("Could not document `{}`.", name))
     }))
 }
 
@@ -609,9 +702,10 @@ fn build_base_args(cx: &mut Context,
 
     cmd.arg(&root_path(cx, unit));
 
-    let color_config = cx.config.shell().color_config();
-    if color_config != ColorConfig::Auto {
-        cmd.arg("--color").arg(&color_config.to_string());
+    match cx.config.shell().color_choice() {
+        ColorChoice::Always => { cmd.arg("--color").arg("always"); }
+        ColorChoice::Never => { cmd.arg("--color").arg("never"); }
+        ColorChoice::CargoAuto => {}
     }
 
     if cx.build_config.json_messages {
@@ -707,7 +801,10 @@ fn build_base_args(cx: &mut Context,
         cmd.arg("--cfg").arg("test");
     }
 
-    for feat in cx.resolve.features(unit.pkg.package_id()).iter() {
+    // We ideally want deterministic invocations of rustc to ensure that
+    // rustc-caching strategies like sccache are able to cache more, so sort the
+    // feature list here.
+    for feat in cx.resolve.features_sorted(unit.pkg.package_id()) {
         cmd.arg("--cfg").arg(&format!("feature=\"{}\"", feat));
     }
 
@@ -717,7 +814,7 @@ fn build_base_args(cx: &mut Context,
             cmd.arg("-C").arg(&format!("extra-filename=-{}", m));
         }
         None => {
-            cmd.arg("-C").arg(&format!("metadata={}", short_hash(unit.pkg)));
+            cmd.arg("-C").arg(&format!("metadata={}", cx.target_short_hash(unit)));
         }
     }
 
@@ -745,8 +842,9 @@ fn build_base_args(cx: &mut Context,
 }
 
 
-fn build_deps_args(cmd: &mut ProcessBuilder, cx: &mut Context, unit: &Unit)
-                   -> CargoResult<()> {
+fn build_deps_args<'a, 'cfg>(cmd: &mut ProcessBuilder,
+                             cx: &mut Context<'a, 'cfg>,
+                             unit: &Unit<'a>) -> CargoResult<()> {
     cmd.arg("-L").arg(&{
         let mut deps = OsString::from("dependency=");
         deps.push(cx.deps_dir(unit));
@@ -774,10 +872,11 @@ fn build_deps_args(cmd: &mut ProcessBuilder, cx: &mut Context, unit: &Unit)
 
     return Ok(());
 
-    fn link_to(cmd: &mut ProcessBuilder, cx: &mut Context, unit: &Unit)
-               -> CargoResult<()> {
-        for (dst, _link_dst, linkable) in cx.target_filenames(unit)? {
-            if !linkable {
+    fn link_to<'a, 'cfg>(cmd: &mut ProcessBuilder,
+                         cx: &mut Context<'a, 'cfg>,
+                         unit: &Unit<'a>) -> CargoResult<()> {
+        for &(ref dst, _, ref linkable) in cx.target_filenames(unit)?.iter() {
+            if !*linkable {
                 continue
             }
             let mut v = OsString::new();

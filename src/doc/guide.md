@@ -12,7 +12,8 @@ To accomplish this goal, Cargo does four things:
 
 * Introduces two metadata files with various bits of project information.
 * Fetches and builds your project’s dependencies.
-* Invokes `rustc` or another build tool with the correct parameters to build your project.
+* Invokes `rustc` or another build tool with the correct parameters to build
+  your project.
 * Introduces conventions to make working with Rust projects easier.
 
 # Creating a new project
@@ -89,7 +90,8 @@ Hello, world!</code></pre>
 You’ll now notice a new file, `Cargo.lock`. It contains information about our
 dependencies. Since we don’t have any yet, it’s not very interesting.
 
-Once you’re ready for release, you can use `cargo build --release` to compile your files with optimizations turned on:
+Once you’re ready for release, you can use `cargo build --release` to compile
+your files with optimizations turned on:
 
 <pre><code class="language-shell"><span class="gp">$</span> cargo build --release
 <span style="font-weight: bold"
@@ -232,12 +234,14 @@ Cargo project:
     └── some-integration-tests.rs
 ```
 
-* `Cargo.toml` and `Cargo.lock` are stored in the root of your project.
+* `Cargo.toml` and `Cargo.lock` are stored in the root of your project (*package
+  root*).
 * Source code goes in the `src` directory.
 * The default library file is `src/lib.rs`.
 * The default executable file is `src/main.rs`.
 * Other executables can be placed in `src/bin/*.rs`.
-* Integration tests go in the `tests` directory (unit tests go in each file they're testing).
+* Integration tests go in the `tests` directory (unit tests go in each file
+  they're testing).
 * Examples go in the `examples` directory.
 * Benchmarks go in the `benches` directory.
 
@@ -249,8 +253,10 @@ description](manifest.html#the-project-layout).
 `Cargo.toml` and `Cargo.lock` serve two different purposes. Before we talk
 about them, here’s a summary:
 
-* `Cargo.toml` is about describing your dependencies in a broad sense, and is written by you.
-* `Cargo.lock` contains exact information about your dependencies. It is maintained by Cargo and should not be manually edited.
+* `Cargo.toml` is about describing your dependencies in a broad sense, and is
+  written by you.
+* `Cargo.lock` contains exact information about your dependencies. It is
+  maintained by Cargo and should not be manually edited.
 
 If you’re building a library that other projects will depend on, put
 `Cargo.lock` in your `.gitignore`. If you’re building an executable like a
@@ -368,7 +374,7 @@ class="s1">     Running</span> target/test/hello_world-9c2b65bbb79eabce
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 </code></pre>
 
 If our project had tests, we would see more output with the correct number of
@@ -410,7 +416,8 @@ information.
 
 # Further reading
 
-Now that you have an overview of how to use cargo and have created your first crate, you may be interested in:
+Now that you have an overview of how to use cargo and have created your first
+crate, you may be interested in:
 
 * [Publishing your crate on crates.io](crates-io.html)
 * [Reading about all the possible ways of specifying dependencies](specifying-dependencies.html)

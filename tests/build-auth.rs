@@ -34,9 +34,9 @@ fn http_auth_offered() {
         let mut conn = BufStream::new(server.accept().unwrap().0);
         let req = headers(&mut conn);
         let user_agent = if cfg!(windows) {
-            "User-Agent: git/1.0 (libgit2 0.25.0)"
+            "User-Agent: git/1.0 (libgit2 0.26.0)"
         } else {
-            "User-Agent: git/2.0 (libgit2 0.25.0)"
+            "User-Agent: git/2.0 (libgit2 0.26.0)"
         };
         conn.write_all(b"\
             HTTP/1.1 401 Unauthorized\r\n\
@@ -203,7 +203,7 @@ fn ssh_something_happens() {
 ", addr = addr))
                     .with_stderr_contains("\
 Caused by:
-  [[..]] Failed to start SSH session: Failed getting banner
+  [[..]] failed to start SSH session: Failed getting banner
 "));
     t.join().ok().unwrap();
 }

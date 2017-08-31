@@ -1,11 +1,13 @@
 #![deny(unused)]
 #![cfg_attr(test, deny(warnings))]
+#![recursion_limit="128"]
 
-#[cfg(test)] extern crate hamcrest;
+#[macro_use] extern crate error_chain;
 #[macro_use] extern crate log;
+#[macro_use] extern crate scoped_tls;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate serde_json;
-extern crate chrono;
+extern crate atty;
 extern crate crates_io as registry;
 extern crate crossbeam;
 extern crate curl;
@@ -15,38 +17,45 @@ extern crate flate2;
 extern crate fs2;
 extern crate git2;
 extern crate glob;
+extern crate hex;
+extern crate home;
+extern crate ignore;
+extern crate jobserver;
 extern crate libc;
 extern crate libgit2_sys;
 extern crate num_cpus;
-extern crate rustc_serialize;
+extern crate same_file;
 extern crate semver;
 extern crate serde;
 extern crate serde_ignored;
 extern crate shell_escape;
 extern crate tar;
 extern crate tempdir;
-extern crate term;
+extern crate termcolor;
 extern crate toml;
 extern crate url;
 extern crate rustc_version;
+#[cfg(target_os = "macos")]
+extern crate core_foundation;
 
-use std::io;
 use std::fmt;
-use rustc_serialize::Decodable;
+use std::error::Error;
+
+use error_chain::ChainedError;
+use serde::Deserialize;
 use serde::ser;
 use docopt::Docopt;
 
-use core::{Shell, MultiShell, ShellConfig, Verbosity, ColorConfig};
-use core::shell::Verbosity::{Verbose};
-use term::color::{BLACK};
+use core::Shell;
+use core::shell::Verbosity::Verbose;
 
-pub use util::{CargoError, CargoResult, CliError, CliResult, human, Config, ChainError};
+pub use util::{CargoError, CargoErrorKind, CargoResult, CliError, CliResult, Config};
 
 pub const CARGO_ENV: &'static str = "CARGO";
 
 macro_rules! bail {
     ($($fmt:tt)*) => (
-        return Err(::util::human(&format_args!($($fmt)*)))
+        return Err(::util::errors::CargoError::from(format_args!($($fmt)*).to_string()))
     )
 }
 
@@ -100,7 +109,7 @@ impl fmt::Display for VersionInfo {
     }
 }
 
-pub fn call_main_without_stdin<Flags: Decodable>(
+pub fn call_main_without_stdin<'de, Flags: Deserialize<'de>>(
             exec: fn(Flags, &Config) -> CliResult,
             config: &Config,
             usage: &str,
@@ -112,9 +121,9 @@ pub fn call_main_without_stdin<Flags: Decodable>(
         .argv(args.iter().map(|s| &s[..]))
         .help(true);
 
-    let flags = docopt.decode().map_err(|e| {
+    let flags = docopt.deserialize().map_err(|e| {
         let code = if e.fatal() {1} else {0};
-        CliError::new(human(e.to_string()), code)
+        CliError::new(e.to_string().into(), code)
     })?;
 
     exec(flags, config)
@@ -125,107 +134,83 @@ pub fn print_json<T: ser::Serialize>(obj: &T) {
     println!("{}", encoded);
 }
 
-pub fn shell(verbosity: Verbosity, color_config: ColorConfig) -> MultiShell {
-    enum Output {
-        Stdout,
-        Stderr,
-    }
-
-    let tty = isatty(Output::Stderr);
-
-    let config = ShellConfig { color_config: color_config, tty: tty };
-    let err = Shell::create(|| Box::new(io::stderr()), config);
-
-    let tty = isatty(Output::Stdout);
-
-    let config = ShellConfig { color_config: color_config, tty: tty };
-    let out = Shell::create(|| Box::new(io::stdout()), config);
-
-    return MultiShell::new(out, err, verbosity);
-
-    #[cfg(unix)]
-    fn isatty(output: Output) -> bool {
-        let fd = match output {
-            Output::Stdout => libc::STDOUT_FILENO,
-            Output::Stderr => libc::STDERR_FILENO,
-        };
-
-        unsafe { libc::isatty(fd) != 0 }
-    }
-    #[cfg(windows)]
-    fn isatty(output: Output) -> bool {
-        extern crate kernel32;
-        extern crate winapi;
-
-        let handle = match output {
-            Output::Stdout => winapi::winbase::STD_OUTPUT_HANDLE,
-            Output::Stderr => winapi::winbase::STD_ERROR_HANDLE,
-        };
-
-        unsafe {
-            let handle = kernel32::GetStdHandle(handle);
-            let mut out = 0;
-            kernel32::GetConsoleMode(handle, &mut out) != 0
-        }
-    }
-}
-
-pub fn exit_with_error(err: CliError, shell: &mut MultiShell) -> ! {
+pub fn exit_with_error(err: CliError, shell: &mut Shell) -> ! {
     debug!("exit_with_error; err={:?}", err);
 
     let CliError { error, exit_code, unknown } = err;
     // exit_code == 0 is non-fatal error, e.g. docopt version info
     let fatal = exit_code != 0;
 
-    let hide = unknown && shell.get_verbose() != Verbose;
+    let hide = unknown && shell.verbosity() != Verbose;
 
     if let Some(error) = error {
-        let _ignored_result = if hide {
-            shell.error("An unknown error occurred")
+        if hide {
+            drop(shell.error("An unknown error occurred"))
         } else if fatal {
-            shell.error(&error)
+            drop(shell.error(&error))
         } else {
-            shell.say(&error, BLACK)
-        };
+            drop(writeln!(shell.err(), "{}", error))
+        }
 
-        if !handle_cause(&error, shell) || hide {
-            let _ = shell.err().say("\nTo learn more, run the command again \
-                                     with --verbose.".to_string(), BLACK);
+        if !handle_cause(error, shell) || hide {
+            drop(writeln!(shell.err(), "\nTo learn more, run the command again \
+                                        with --verbose."));
         }
     }
 
     std::process::exit(exit_code)
 }
 
-pub fn handle_error(err: &CargoError, shell: &mut MultiShell) {
-    debug!("handle_error; err={:?}", err);
+pub fn handle_error(err: CargoError, shell: &mut Shell) {
+    debug!("handle_error; err={:?}", &err);
 
-    let _ignored_result = shell.error(err);
+    let _ignored_result = shell.error(&err);
     handle_cause(err, shell);
 }
 
-fn handle_cause(mut cargo_err: &CargoError, shell: &mut MultiShell) -> bool {
-    let verbose = shell.get_verbose();
-    let mut err;
-    loop {
-        cargo_err = match cargo_err.cargo_cause() {
-            Some(cause) => cause,
-            None => { err = cargo_err.cause(); break }
-        };
-        if verbose != Verbose && !cargo_err.is_human() { return false }
-        print(cargo_err.to_string(), shell);
-    }
-    loop {
-        let cause = match err { Some(err) => err, None => return true };
-        if verbose != Verbose { return false }
-        print(cause.to_string(), shell);
-        err = cause.cause();
+fn handle_cause<E, EKind>(cargo_err: E, shell: &mut Shell) -> bool
+    where E: ChainedError<ErrorKind=EKind> + 'static
+{
+    fn print(error: String, shell: &mut Shell) {
+        drop(writeln!(shell.err(), "\nCaused by:"));
+        drop(writeln!(shell.err(), "  {}", error));
     }
 
-    fn print(error: String, shell: &mut MultiShell) {
-        let _ = shell.err().say("\nCaused by:", BLACK);
-        let _ = shell.err().say(format!("  {}", error), BLACK);
+    //Error inspection in non-verbose mode requires inspecting the
+    //error kind to avoid printing Internal errors. The downcasting
+    //machinery requires &(Error + 'static), but the iterator (and
+    //underlying `cause`) return &Error. Because the borrows are
+    //constrained to this handling method, and because the original
+    //error object is constrained to be 'static, we're casting away
+    //the borrow's actual lifetime for purposes of downcasting and
+    //inspecting the error chain
+    unsafe fn extend_lifetime(r: &Error) -> &(Error + 'static) {
+        std::mem::transmute::<&Error, &Error>(r)
     }
+
+    let verbose = shell.verbosity();
+
+    if verbose == Verbose {
+        //The first error has already been printed to the shell
+        //Print all remaining errors
+        for err in cargo_err.iter().skip(1) {
+            print(err.to_string(), shell);
+        }
+    } else {
+        //The first error has already been printed to the shell
+        //Print remaining errors until one marked as Internal appears
+        for err in cargo_err.iter().skip(1) {
+            let err = unsafe { extend_lifetime(err) };
+            if let Some(&CargoError(CargoErrorKind::Internal(..), ..)) =
+                err.downcast_ref::<CargoError>() {
+                return false;
+            }
+
+            print(err.to_string(), shell);
+        }
+    }
+
+    true
 }
 
 pub fn version() -> VersionInfo {

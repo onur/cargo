@@ -1,7 +1,7 @@
 use cargo::ops;
 use cargo::util::{CliResult, Config};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options {
     arg_crate: Option<String>,
     flag_token: Option<String>,
@@ -13,6 +13,8 @@ pub struct Options {
     flag_undo: bool,
     flag_frozen: bool,
     flag_locked: bool,
+    #[serde(rename = "flag_Z")]
+    flag_z: Vec<String>,
 }
 
 pub static USAGE: &'static str = "
@@ -32,6 +34,7 @@ Options:
     --color WHEN        Coloring: auto, always, never
     --frozen            Require Cargo.lock and cache are up to date
     --locked            Require Cargo.lock is up to date
+    -Z FLAG ...         Unstable (nightly-only) flags to Cargo
 
 The yank command removes a previously pushed crate's version from the server's
 index. This command does not delete any data, and the crate will still be
@@ -47,7 +50,8 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
                      options.flag_quiet,
                      &options.flag_color,
                      options.flag_frozen,
-                     options.flag_locked)?;
+                     options.flag_locked,
+                     &options.flag_z)?;
     ops::yank(config,
               options.arg_crate,
               options.flag_vers,
