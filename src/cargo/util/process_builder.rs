@@ -5,15 +5,19 @@ use std::fmt;
 use std::path::Path;
 use std::process::{Command, Stdio, Output};
 
-use util::{CargoResult, ProcessError, process_error, read2};
+use jobserver::Client;
 use shell_escape::escape;
 
-#[derive(Clone, PartialEq, Debug)]
+use util::{CargoResult, CargoResultExt, CargoError, process_error, read2};
+use util::errors::CargoErrorKind;
+
+#[derive(Clone, Debug)]
 pub struct ProcessBuilder {
     program: OsString,
     args: Vec<OsString>,
     env: HashMap<String, Option<OsString>>,
     cwd: Option<OsString>,
+    jobserver: Option<Client>,
 }
 
 impl fmt::Display for ProcessBuilder {
@@ -29,6 +33,11 @@ impl fmt::Display for ProcessBuilder {
 }
 
 impl ProcessBuilder {
+    pub fn program<T: AsRef<OsStr>>(&mut self, program: T) -> &mut ProcessBuilder {
+        self.program = program.as_ref().to_os_string();
+        self
+    }
+
     pub fn arg<T: AsRef<OsStr>>(&mut self, arg: T) -> &mut ProcessBuilder {
         self.args.push(arg.as_ref().to_os_string());
         self
@@ -38,6 +47,13 @@ impl ProcessBuilder {
         self.args.extend(arguments.iter().map(|t| {
             t.as_ref().to_os_string()
         }));
+        self
+    }
+
+    pub fn args_replace<T: AsRef<OsStr>>(&mut self, arguments: &[T]) -> &mut ProcessBuilder {
+        self.args = arguments.iter().map(|t| {
+            t.as_ref().to_os_string()
+        }).collect();
         self
     }
 
@@ -57,6 +73,10 @@ impl ProcessBuilder {
         self
     }
 
+    pub fn get_program(&self) -> &OsString {
+        &self.program
+    }
+
     pub fn get_args(&self) -> &[OsString] {
         &self.args
     }
@@ -72,61 +92,68 @@ impl ProcessBuilder {
 
     pub fn get_envs(&self) -> &HashMap<String, Option<OsString>> { &self.env }
 
-    pub fn exec(&self) -> Result<(), ProcessError> {
+    pub fn inherit_jobserver(&mut self, jobserver: &Client) -> &mut Self {
+        self.jobserver = Some(jobserver.clone());
+        self
+    }
+
+    pub fn exec(&self) -> CargoResult<()> {
         let mut command = self.build_command();
-        let exit = command.status().map_err(|e| {
-            process_error(&format!("could not execute process `{}`",
-                                   self.debug_string()),
-                          Some(Box::new(e)), None, None)
+        let exit = command.status().chain_err(|| {
+            CargoErrorKind::ProcessErrorKind(
+                process_error(&format!("could not execute process `{}`",
+                                   self.debug_string()), None, None))
         })?;
 
         if exit.success() {
             Ok(())
         } else {
-            Err(process_error(&format!("process didn't exit successfully: `{}`",
-                                       self.debug_string()),
-                              None, Some(&exit), None))
+            Err(CargoErrorKind::ProcessErrorKind(process_error(
+                &format!("process didn't exit successfully: `{}`", self.debug_string()),
+                Some(&exit), None)).into())
         }
     }
 
     #[cfg(unix)]
-    pub fn exec_replace(&self) -> Result<(), ProcessError> {
+    pub fn exec_replace(&self) -> CargoResult<()> {
         use std::os::unix::process::CommandExt;
 
         let mut command = self.build_command();
         let error = command.exec();
-        Err(process_error(&format!("could not execute process `{}`",
-                                   self.debug_string()),
-                          Some(Box::new(error)), None, None))
+        Err(CargoError::with_chain(error,
+            CargoErrorKind::ProcessErrorKind(process_error(
+                &format!("could not execute process `{}`", self.debug_string()), None, None))))
     }
 
     #[cfg(windows)]
-    pub fn exec_replace(&self) -> Result<(), ProcessError> {
+    pub fn exec_replace(&self) -> CargoResult<()> {
         self.exec()
     }
 
-    pub fn exec_with_output(&self) -> Result<Output, ProcessError> {
+    pub fn exec_with_output(&self) -> CargoResult<Output> {
         let mut command = self.build_command();
 
-        let output = command.output().map_err(|e| {
-            process_error(&format!("could not execute process `{}`",
-                                   self.debug_string()),
-                          Some(Box::new(e)), None, None)
+        let output = command.output().chain_err(|| {
+            CargoErrorKind::ProcessErrorKind(
+                process_error(
+                    &format!("could not execute process `{}`", self.debug_string()),
+                          None, None))
         })?;
 
         if output.status.success() {
             Ok(output)
         } else {
-            Err(process_error(&format!("process didn't exit successfully: `{}`",
-                                       self.debug_string()),
-                              None, Some(&output.status), Some(&output)))
+            Err(CargoErrorKind::ProcessErrorKind(process_error(
+                &format!("process didn't exit successfully: `{}`", self.debug_string()),
+                Some(&output.status), Some(&output))).into())
         }
     }
 
     pub fn exec_with_streaming(&self,
                                on_stdout_line: &mut FnMut(&str) -> CargoResult<()>,
-                               on_stderr_line: &mut FnMut(&str) -> CargoResult<()>)
-                               -> Result<Output, ProcessError> {
+                               on_stderr_line: &mut FnMut(&str) -> CargoResult<()>,
+                               print_output: bool)
+                               -> CargoResult<Output> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -166,27 +193,37 @@ impl ProcessBuilder {
                 }
             })?;
             child.wait()
-        })().map_err(|e| {
-            process_error(&format!("could not execute process `{}`",
-                                   self.debug_string()),
-                          Some(Box::new(e)), None, None)
+        })().chain_err(|| {
+            CargoErrorKind::ProcessErrorKind(
+                process_error(&format!("could not execute process `{}`",
+                    self.debug_string()),
+                None, None))
         })?;
         let output = Output {
             stdout: stdout,
             stderr: stderr,
             status: status,
         };
-        if !output.status.success() {
-            Err(process_error(&format!("process didn't exit successfully: `{}`",
-                                       self.debug_string()),
-                              None, Some(&output.status), Some(&output)))
-        } else if let Some(e) = callback_error {
-            Err(process_error(&format!("failed to parse process output: `{}`",
-                                       self.debug_string()),
-                              Some(Box::new(e)), Some(&output.status), Some(&output)))
-        } else {
-            Ok(output)
+
+        {
+            let to_print = if print_output {
+                Some(&output)
+            } else {
+                None
+            };
+            if !output.status.success() {
+                return Err(CargoErrorKind::ProcessErrorKind(process_error(
+                            &format!("process didn't exit successfully: `{}`", self.debug_string()),
+                            Some(&output.status), to_print)).into())
+            } else if let Some(e) = callback_error {
+                return Err(CargoError::with_chain(e,
+                        CargoErrorKind::ProcessErrorKind(process_error(
+                                &format!("failed to parse process output: `{}`", self.debug_string()),
+                                Some(&output.status), to_print))))
+            }
         }
+
+        Ok(output)
     }
 
     pub fn build_command(&self) -> Command {
@@ -202,6 +239,9 @@ impl ProcessBuilder {
                 Some(ref v) => { command.env(k, v); }
                 None => { command.env_remove(k); }
             }
+        }
+        if let Some(ref c) = self.jobserver {
+            c.configure(&mut command);
         }
         command
     }
@@ -222,5 +262,6 @@ pub fn process<T: AsRef<OsStr>>(cmd: T) -> ProcessBuilder {
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
+        jobserver: None,
     }
 }

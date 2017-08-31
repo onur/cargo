@@ -5,7 +5,8 @@ use url::Url;
 use core::source::{Source, SourceId};
 use core::GitReference;
 use core::{Package, PackageId, Summary, Registry, Dependency};
-use util::{CargoResult, Config};
+use util::Config;
+use util::errors::{CargoError, CargoResult};
 use util::hex::short_hash;
 use sources::PathSource;
 use sources::git::utils::{GitRemote, GitRevision};
@@ -24,18 +25,18 @@ pub struct GitSource<'cfg> {
 
 impl<'cfg> GitSource<'cfg> {
     pub fn new(source_id: &SourceId,
-               config: &'cfg Config) -> GitSource<'cfg> {
+               config: &'cfg Config) -> CargoResult<GitSource<'cfg>> {
         assert!(source_id.is_git(), "id is not git, id={}", source_id);
 
         let remote = GitRemote::new(source_id.url());
-        let ident = ident(source_id.url());
+        let ident = ident(source_id.url())?;
 
         let reference = match source_id.precise() {
             Some(s) => GitReference::Rev(s.to_string()),
             None => source_id.git_reference().unwrap().clone(),
         };
 
-        GitSource {
+        let source = GitSource {
             remote: remote,
             reference: reference,
             source_id: source_id.clone(),
@@ -43,7 +44,9 @@ impl<'cfg> GitSource<'cfg> {
             rev: None,
             ident: ident,
             config: config,
-        }
+        };
+
+        Ok(source)
     }
 
     pub fn url(&self) -> &Url { self.remote.url() }
@@ -56,8 +59,8 @@ impl<'cfg> GitSource<'cfg> {
     }
 }
 
-fn ident(url: &Url) -> String {
-    let url = canonicalize_url(url);
+fn ident(url: &Url) -> CargoResult<String> {
+    let url = canonicalize_url(url)?;
     let ident = url.path_segments().and_then(|mut s| s.next_back()).unwrap_or("");
 
     let ident = if ident == "" {
@@ -66,12 +69,18 @@ fn ident(url: &Url) -> String {
         ident
     };
 
-    format!("{}-{}", ident, short_hash(&url))
+    Ok(format!("{}-{}", ident, short_hash(&url)))
 }
 
 // Some hacks and heuristics for making equivalent URLs hash the same
-pub fn canonicalize_url(url: &Url) -> Url {
+pub fn canonicalize_url(url: &Url) -> CargoResult<Url> {
     let mut url = url.clone();
+
+    // cannot-be-a-base-urls are not supported 
+    // eg. github.com:rust-lang-nursery/rustfmt.git
+    if url.cannot_be_a_base() {
+        return Err(format!("invalid url `{}`: cannot-be-a-base-URLs are not supported", url).into());
+    }
 
     // Strip a trailing slash
     if url.path().ends_with('/') {
@@ -99,14 +108,14 @@ pub fn canonicalize_url(url: &Url) -> Url {
         url.path_segments_mut().unwrap().pop().push(&last);
     }
 
-    url
+    Ok(url)
 }
 
 impl<'cfg> Debug for GitSource<'cfg> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "git repo at {}", self.remote.url())?;
 
-        match self.reference.to_ref_string() {
+        match self.reference.pretty_ref() {
             Some(s) => write!(f, " ({})", s),
             None => Ok(())
         }
@@ -114,10 +123,12 @@ impl<'cfg> Debug for GitSource<'cfg> {
 }
 
 impl<'cfg> Registry for GitSource<'cfg> {
-    fn query(&mut self, dep: &Dependency) -> CargoResult<Vec<Summary>> {
+    fn query(&mut self,
+             dep: &Dependency,
+             f: &mut FnMut(Summary)) -> CargoResult<()> {
         let src = self.path_source.as_mut()
                       .expect("BUG: update() must be called before query()");
-        src.query(dep)
+        src.query(dep, f)
     }
 }
 
@@ -147,7 +158,7 @@ impl<'cfg> Source for GitSource<'cfg> {
             trace!("updating git source `{:?}`", self.remote);
 
             let repo = self.remote.checkout(&db_path, self.config)?;
-            let rev = repo.rev_for(&self.reference)?;
+            let rev = repo.rev_for(&self.reference).map_err(CargoError::into_internal)?;
             (repo, rev)
         } else {
             (self.remote.db_at(&db_path)?, actual_rev.unwrap())
@@ -199,42 +210,48 @@ mod test {
 
     #[test]
     pub fn test_url_to_path_ident_with_path() {
-        let ident = ident(&url("https://github.com/carlhuda/cargo"));
+        let ident = ident(&url("https://github.com/carlhuda/cargo")).unwrap();
         assert!(ident.starts_with("cargo-"));
     }
 
     #[test]
     pub fn test_url_to_path_ident_without_path() {
-        let ident = ident(&url("https://github.com"));
+        let ident = ident(&url("https://github.com")).unwrap();
         assert!(ident.starts_with("_empty-"));
     }
 
     #[test]
     fn test_canonicalize_idents_by_stripping_trailing_url_slash() {
-        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston/"));
-        let ident2 = ident(&url("https://github.com/PistonDevelopers/piston"));
+        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston/")).unwrap();
+        let ident2 = ident(&url("https://github.com/PistonDevelopers/piston")).unwrap();
         assert_eq!(ident1, ident2);
     }
 
     #[test]
     fn test_canonicalize_idents_by_lowercasing_github_urls() {
-        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston"));
-        let ident2 = ident(&url("https://github.com/pistondevelopers/piston"));
+        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston")).unwrap();
+        let ident2 = ident(&url("https://github.com/pistondevelopers/piston")).unwrap();
         assert_eq!(ident1, ident2);
     }
 
     #[test]
     fn test_canonicalize_idents_by_stripping_dot_git() {
-        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston"));
-        let ident2 = ident(&url("https://github.com/PistonDevelopers/piston.git"));
+        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston")).unwrap();
+        let ident2 = ident(&url("https://github.com/PistonDevelopers/piston.git")).unwrap();
         assert_eq!(ident1, ident2);
     }
 
     #[test]
-    fn test_canonicalize_idents_different_protocls() {
-        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston"));
-        let ident2 = ident(&url("git://github.com/PistonDevelopers/piston"));
+    fn test_canonicalize_idents_different_protocols() {
+        let ident1 = ident(&url("https://github.com/PistonDevelopers/piston")).unwrap();
+        let ident2 = ident(&url("git://github.com/PistonDevelopers/piston")).unwrap();
         assert_eq!(ident1, ident2);
+    }
+
+    #[test]
+    fn test_canonicalize_cannot_be_a_base_urls() {
+        assert!(ident(&url("github.com:PistonDevelopers/piston")).is_err());
+        assert!(ident(&url("google.com:PistonDevelopers/piston")).is_err());
     }
 
     fn url(s: &str) -> Url {

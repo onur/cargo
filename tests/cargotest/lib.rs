@@ -1,28 +1,21 @@
 #![deny(warnings)]
 
-extern crate bufstream;
 extern crate cargo;
 extern crate filetime;
 extern crate flate2;
 extern crate git2;
 extern crate hamcrest;
-extern crate libc;
-extern crate rustc_serialize;
-extern crate serde;
+extern crate hex;
 #[macro_use]
 extern crate serde_json;
 extern crate tar;
-extern crate tempdir;
-extern crate term;
 extern crate url;
-#[cfg(windows)] extern crate kernel32;
-#[cfg(windows)] extern crate winapi;
 
-use cargo::util::Rustc;
 use std::ffi::OsStr;
 use std::time::Duration;
+
+use cargo::util::Rustc;
 use std::path::PathBuf;
-use std::env;
 
 pub mod support;
 pub mod install;
@@ -51,6 +44,12 @@ fn _process(t: &OsStr) -> cargo::util::ProcessBuilder {
      .env("HOME", support::paths::home())
      .env("CARGO_HOME", support::paths::home().join(".cargo"))
      .env("__CARGO_TEST_ROOT", support::paths::root())
+
+     // Force cargo to think it's on the stable channel for all tests, this
+     // should hopefully not suprise us as we add cargo features over time and
+     // cargo rides the trains
+     .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")
+
      .env_remove("__CARGO_DEFAULT_LIB_METADATA")
      .env_remove("RUSTC")
      .env_remove("RUSTDOC")
@@ -60,42 +59,26 @@ fn _process(t: &OsStr) -> cargo::util::ProcessBuilder {
      .env_remove("XDG_CONFIG_HOME")      // see #2345
      .env("GIT_CONFIG_NOSYSTEM", "1")    // keep trying to sandbox ourselves
      .env_remove("EMAIL")
+     .env_remove("MFLAGS")
+     .env_remove("MAKEFLAGS")
+     .env_remove("CARGO_MAKEFLAGS")
      .env_remove("GIT_AUTHOR_NAME")
      .env_remove("GIT_AUTHOR_EMAIL")
      .env_remove("GIT_COMMITTER_NAME")
      .env_remove("GIT_COMMITTER_EMAIL")
      .env_remove("CARGO_TARGET_DIR")     // we assume 'target'
      .env_remove("MSYSTEM");             // assume cmd.exe everywhere on windows
-
-    // We'll need dynamic libraries at some point in this test suite, so ensure
-    // that the rustc libdir is somewhere in LD_LIBRARY_PATH as appropriate.
-    // Note that this isn't needed on Windows as we assume the bindir (with
-    // dlls) is in PATH.
-    if cfg!(unix) {
-        let var = if cfg!(target_os = "macos") {
-            "DYLD_LIBRARY_PATH"
-        } else {
-            "LD_LIBRARY_PATH"
-        };
-        let rustc = RUSTC.with(|r| r.path.clone());
-        let path = env::var_os("PATH").unwrap_or(Default::default());
-        let rustc = env::split_paths(&path)
-                        .map(|p| p.join(&rustc))
-                        .find(|p| p.exists())
-                        .unwrap();
-        let mut libdir = rustc.clone();
-        libdir.pop();
-        libdir.pop();
-        libdir.push("lib");
-        let prev = env::var_os(&var).unwrap_or(Default::default());
-        let mut paths = env::split_paths(&prev).collect::<Vec<_>>();
-        println!("libdir: {:?}", libdir);
-        if !paths.contains(&libdir) {
-            paths.push(libdir);
-            p.env(var, env::join_paths(&paths).unwrap());
-        }
-    }
     return p
+}
+
+pub trait ChannelChanger: Sized {
+    fn masquerade_as_nightly_cargo(&mut self) -> &mut Self;
+}
+
+impl ChannelChanger for cargo::util::ProcessBuilder {
+    fn masquerade_as_nightly_cargo(&mut self) -> &mut Self {
+        self.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly")
+    }
 }
 
 pub fn cargo_process() -> cargo::util::ProcessBuilder {

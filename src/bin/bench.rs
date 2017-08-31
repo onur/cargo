@@ -1,9 +1,11 @@
+use std::env;
+
 use cargo::core::Workspace;
 use cargo::ops::{self, MessageFormat, Packages};
-use cargo::util::{CliResult, CliError, Human, Config, human};
+use cargo::util::{CliResult, CliError, Config, CargoErrorKind};
 use cargo::util::important_paths::{find_root_manifest_for_wd};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options {
     flag_no_run: bool,
     flag_package: Vec<String>,
@@ -26,10 +28,15 @@ pub struct Options {
     flag_tests: bool,
     flag_bench: Vec<String>,
     flag_benches: bool,
+    flag_all_targets: bool,
+    flag_no_fail_fast: bool,
     flag_frozen: bool,
     flag_locked: bool,
     arg_args: Vec<String>,
     flag_all: bool,
+    flag_exclude: Vec<String>,
+    #[serde(rename = "flag_Z")]
+    flag_z: Vec<String>,
 }
 
 pub const USAGE: &'static str = "
@@ -49,9 +56,11 @@ Options:
     --tests                      Benchmark all tests
     --bench NAME                 Benchmark only the specified bench target
     --benches                    Benchmark all benches
+    --all-targets                Benchmark all targets (default)
     --no-run                     Compile, but don't run benchmarks
     -p SPEC, --package SPEC ...  Package to run benchmarks for
     --all                        Benchmark all packages in the workspace
+    --exclude SPEC ...           Exclude packages from the benchmark
     -j N, --jobs N               Number of parallel jobs, defaults to # of CPUs
     --features FEATURES          Space-separated list of features to also build
     --all-features               Build all available features
@@ -62,8 +71,10 @@ Options:
     -q, --quiet                  No output printed to stdout
     --color WHEN                 Coloring: auto, always, never
     --message-format FMT         Error format: human, json [default: human]
+    --no-fail-fast               Run all benchmarks regardless of failure
     --frozen                     Require Cargo.lock and cache are up to date
     --locked                     Require Cargo.lock is up to date
+    -Z FLAG ...                  Unstable (nightly-only) flags to Cargo
 
 All of the trailing arguments are passed to the benchmark binaries generated
 for filtering benchmarks and generally providing options configuring how they
@@ -84,22 +95,27 @@ Compilation can be customized with the `bench` profile in the manifest.
 ";
 
 pub fn execute(options: Options, config: &Config) -> CliResult {
-    let root = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
-
-    let spec = if options.flag_all {
-        Packages::All
-    } else {
-        Packages::Packages(&options.flag_package)
-    };
+    debug!("executing; cmd=cargo-bench; args={:?}",
+           env::args().collect::<Vec<_>>());
 
     config.configure(options.flag_verbose,
                      options.flag_quiet,
                      &options.flag_color,
                      options.flag_frozen,
-                     options.flag_locked)?;
+                     options.flag_locked,
+                     &options.flag_z)?;
+
+    let root = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
+    let ws = Workspace::new(&root, config)?;
+
+    let spec = Packages::from_flags(ws.is_virtual(),
+                                    options.flag_all,
+                                    &options.flag_exclude,
+                                    &options.flag_package)?;
+
     let ops = ops::TestOptions {
         no_run: options.flag_no_run,
-        no_fail_fast: false,
+        no_fail_fast: options.flag_no_fail_fast,
         only_doc: false,
         compile_opts: ops::CompileOptions {
             config: config,
@@ -115,21 +131,21 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
                                             &options.flag_bin, options.flag_bins,
                                             &options.flag_test, options.flag_tests,
                                             &options.flag_example, options.flag_examples,
-                                            &options.flag_bench, options.flag_benches,),
+                                            &options.flag_bench, options.flag_benches,
+                                            options.flag_all_targets),
             message_format: options.flag_message_format,
             target_rustdoc_args: None,
             target_rustc_args: None,
         },
     };
 
-    let ws = Workspace::new(&root, config)?;
     let err = ops::run_benches(&ws, &ops, &options.arg_args)?;
     match err {
         None => Ok(()),
         Some(err) => {
             Err(match err.exit.as_ref().and_then(|e| e.code()) {
-                Some(i) => CliError::new(human("bench failed"), i),
-                None => CliError::new(Box::new(Human(err)), 101)
+                Some(i) => CliError::new("bench failed".into(), i),
+                None => CliError::new(CargoErrorKind::CargoTestErrorKind(err).into(), 101)
             })
         }
     }

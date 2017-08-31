@@ -3,12 +3,13 @@ use std::io::*;
 use std::io;
 use std::path::{Path, PathBuf, Display};
 
-use term::color::CYAN;
+use termcolor::Color::Cyan;
 use fs2::{FileExt, lock_contended_error};
 #[allow(unused_imports)]
 use libc;
 
-use util::{CargoResult, ChainError, Config, human};
+use util::Config;
+use util::errors::{CargoResult, CargoResultExt};
 
 pub struct FileLock {
     f: Option<File>,
@@ -211,8 +212,8 @@ impl Filesystem {
             } else {
                 Err(e)
             }
-        }).chain_error(|| {
-            human(format!("failed to open: {}", path.display()))
+        }).chain_err(|| {
+            format!("failed to open: {}", path.display())
         })?;
         match state {
             State::Exclusive => {
@@ -270,10 +271,11 @@ fn acquire(config: &Config,
     match try() {
         Ok(()) => return Ok(()),
 
-        // Like above, where we ignore file locking on NFS mounts on Linux, we
-        // do the same on OSX here. Note that ENOTSUP is an OSX_specific
-        // constant.
-        #[cfg(target_os = "macos")]
+        // In addition to ignoring NFS which is commonly not working we also
+        // just ignore locking on filesystems that look like they don't
+        // implement file locking. We detect that here via the return value of
+        // locking (e.g. inspecting errno).
+        #[cfg(unix)]
         Err(ref e) if e.raw_os_error() == Some(libc::ENOTSUP) => return Ok(()),
 
         #[cfg(target_os = "linux")]
@@ -281,17 +283,17 @@ fn acquire(config: &Config,
 
         Err(e) => {
             if e.raw_os_error() != lock_contended_error().raw_os_error() {
-                return Err(human(e)).chain_error(|| {
-                    human(format!("failed to lock file: {}", path.display()))
+                return Err(e).chain_err(|| {
+                    format!("failed to lock file: {}", path.display())
                 })
             }
         }
     }
     let msg = format!("waiting for file lock on {}", msg);
-    config.shell().err().say_status("Blocking", &msg, CYAN, true)?;
+    config.shell().status_with_color("Blocking", &msg, Cyan)?;
 
-    return block().chain_error(|| {
-        human(format!("failed to lock file: {}", path.display()))
+    return block().chain_err(|| {
+        format!("failed to lock file: {}", path.display())
     });
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]

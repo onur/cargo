@@ -2,10 +2,10 @@ use std::iter::FromIterator;
 
 use cargo::core::Workspace;
 use cargo::ops::{self, MessageFormat, Packages};
-use cargo::util::{CliResult, CliError, Config, Human};
+use cargo::util::{CliResult, CliError, Config, CargoErrorKind};
 use cargo::util::important_paths::{find_root_manifest_for_wd};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options {
     flag_bin: Option<String>,
     flag_example: Option<String>,
@@ -24,6 +24,8 @@ pub struct Options {
     flag_frozen: bool,
     flag_locked: bool,
     arg_args: Vec<String>,
+    #[serde(rename = "flag_Z")]
+    flag_z: Vec<String>,
 }
 
 pub const USAGE: &'static str = "
@@ -50,6 +52,7 @@ Options:
     --message-format FMT         Error format: human, json [default: human]
     --frozen                     Require Cargo.lock and cache are up to date
     --locked                     Require Cargo.lock is up to date
+    -Z FLAG ...                  Unstable (nightly-only) flags to Cargo
 
 If neither `--bin` nor `--example` are given, then if the project only has one
 bin target it will be run. Otherwise `--bin` specifies the bin target to run,
@@ -66,7 +69,8 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
                      options.flag_quiet,
                      &options.flag_color,
                      options.flag_frozen,
-                     options.flag_locked)?;
+                     options.flag_locked,
+                     &options.flag_z)?;
 
     let root = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
 
@@ -92,13 +96,14 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
         release: options.flag_release,
         mode: ops::CompileMode::Build,
         filter: if examples.is_empty() && bins.is_empty() {
-            ops::CompileFilter::Everything { required_features_filterable: false, }
+            ops::CompileFilter::Default { required_features_filterable: false, }
         } else {
             ops::CompileFilter::new(false,
                                     &bins, false,
                                     &[], false,
                                     &examples, false,
-                                    &[], false)
+                                    &[], false,
+                                    false)
         },
         message_format: options.flag_message_format,
         target_rustdoc_args: None,
@@ -113,7 +118,8 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
             // bad and we always want to forward that up.
             let exit = match err.exit.clone() {
                 Some(exit) => exit,
-                None => return Err(CliError::new(Box::new(Human(err)), 101)),
+                None => return Err(
+                    CliError::new(CargoErrorKind::ProcessErrorKind(err).into(), 101)),
             };
 
             // If `-q` was passed then we suppress extra error information about
@@ -123,7 +129,7 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
             Err(if options.flag_quiet == Some(true) {
                 CliError::code(exit_code)
             } else {
-                CliError::new(Box::new(Human(err)), exit_code)
+                CliError::new(CargoErrorKind::ProcessErrorKind(err).into(), exit_code)
             })
         }
     }

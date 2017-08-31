@@ -1,14 +1,11 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::iter::repeat;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use curl::easy::{Easy, SslOpt};
 use git2;
 use registry::{Registry, NewCrate, NewCrateDependency};
-use term::color::BLACK;
 
 use url::percent_encoding::{percent_encode, QUERY_ENCODE_SET};
 
@@ -19,10 +16,10 @@ use core::dependency::Kind;
 use core::manifest::ManifestMetadata;
 use ops;
 use sources::{RegistrySource};
-use util::config;
+use util::config::{self, Config};
 use util::paths;
-use util::{CargoResult, human, ChainError, ToUrl};
-use util::config::{Config, ConfigValue, Location};
+use util::ToUrl;
+use util::errors::{CargoError, CargoResult, CargoResultExt};
 use util::important_paths::find_root_manifest_for_wd;
 
 pub struct RegistryConfig {
@@ -37,6 +34,7 @@ pub struct PublishOpts<'cfg> {
     pub verify: bool,
     pub allow_dirty: bool,
     pub jobs: Option<u32>,
+    pub target: Option<&'cfg str>,
     pub dry_run: bool,
 }
 
@@ -47,10 +45,13 @@ pub fn publish(ws: &Workspace, opts: &PublishOpts) -> CargoResult<()> {
         bail!("some crates cannot be published.\n\
                `{}` is marked as unpublishable", pkg.name());
     }
+    if pkg.manifest().patch().len() > 0 {
+        bail!("published crates cannot contain [patch] sections");
+    }
 
     let (mut registry, reg_id) = registry(opts.config,
-                                               opts.token.clone(),
-                                               opts.index.clone())?;
+                                          opts.token.clone(),
+                                          opts.index.clone())?;
     verify_dependencies(pkg, &reg_id)?;
 
     // Prepare a tarball, with a non-surpressable warning if metadata
@@ -61,6 +62,7 @@ pub fn publish(ws: &Workspace, opts: &PublishOpts) -> CargoResult<()> {
         list: false,
         check_metadata: true,
         allow_dirty: opts.allow_dirty,
+        target: opts.target,
         jobs: opts.jobs,
     })?.unwrap();
 
@@ -175,7 +177,7 @@ fn transmit(config: &Config,
 
             Ok(())
         },
-        Err(e) => Err(human(e.to_string())),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -195,13 +197,13 @@ pub fn registry(config: &Config,
     } = registry_configuration(config)?;
     let token = token.or(token_config);
     let sid = match index {
-        Some(index) => SourceId::for_registry(&index.to_url()?),
+        Some(index) => SourceId::for_registry(&index.to_url()?)?,
         None => SourceId::crates_io(config)?,
     };
     let api_host = {
         let mut src = RegistrySource::remote(&sid, config);
-        src.update().chain_error(|| {
-            human(format!("failed to update {}", sid))
+        src.update().chain_err(|| {
+            format!("failed to update {}", sid)
         })?;
         (src.config()?).unwrap().api
     };
@@ -284,16 +286,14 @@ pub fn http_timeout(config: &Config) -> CargoResult<Option<i64>> {
 }
 
 pub fn registry_login(config: &Config, token: String) -> CargoResult<()> {
-    let RegistryConfig { index, token: _ } = registry_configuration(config)?;
-    let mut map = HashMap::new();
-    let p = config.cwd().to_path_buf();
-    if let Some(index) = index {
-        map.insert("index".to_string(), ConfigValue::String(index, p.clone()));
+    let RegistryConfig { index: _, token: old_token } = registry_configuration(config)?;
+    if let Some(old_token) = old_token {
+        if old_token == token {
+            return Ok(());
+        }
     }
-    map.insert("token".to_string(), ConfigValue::String(token, p));
 
-    config::set_config(config, Location::Global, "registry",
-                       ConfigValue::Table(map, PathBuf::from(".")))
+    config::save_credentials(config, token)
 }
 
 pub struct OwnersOptions {
@@ -323,7 +323,7 @@ pub fn modify_owners(config: &Config, opts: &OwnersOptions) -> CargoResult<()> {
         config.shell().status("Owner", format!("adding {:?} to crate {}",
                                                     v, name))?;
         registry.add_owners(&name, &v).map_err(|e| {
-            human(format!("failed to add owners to crate {}: {}", name, e))
+            CargoError::from(format!("failed to add owners to crate {}: {}", name, e))
         })?;
     }
 
@@ -332,13 +332,13 @@ pub fn modify_owners(config: &Config, opts: &OwnersOptions) -> CargoResult<()> {
         config.shell().status("Owner", format!("removing {:?} from crate {}",
                                                     v, name))?;
         registry.remove_owners(&name, &v).map_err(|e| {
-            human(format!("failed to remove owners from crate {}: {}", name, e))
+            CargoError::from(format!("failed to remove owners from crate {}: {}", name, e))
         })?;
     }
 
     if opts.list {
         let owners = registry.list_owners(&name).map_err(|e| {
-            human(format!("failed to list owners of crate {}: {}", name, e))
+            CargoError::from(format!("failed to list owners of crate {}: {}", name, e))
         })?;
         for owner in owners.iter() {
             print!("{}", owner.login);
@@ -378,12 +378,12 @@ pub fn yank(config: &Config,
     if undo {
         config.shell().status("Unyank", format!("{}:{}", name, version))?;
         registry.unyank(&name, &version).map_err(|e| {
-            human(format!("failed to undo a yank: {}", e))
+            CargoError::from(format!("failed to undo a yank: {}", e))
         })?;
     } else {
         config.shell().status("Yank", format!("{}:{}", name, version))?;
         registry.yank(&name, &version).map_err(|e| {
-            human(format!("failed to yank: {}", e))
+            CargoError::from(format!("failed to yank: {}", e))
         })?;
     }
 
@@ -404,7 +404,7 @@ pub fn search(query: &str,
 
     let (mut registry, _) = registry(config, None, index)?;
     let (crates, total_crates) = registry.search(query, limit).map_err(|e| {
-        human(format!("failed to retrieve search results from the registry: {}", e))
+        CargoError::from(format!("failed to retrieve search results from the registry: {}", e))
     })?;
 
     let list_items = crates.iter()
@@ -428,25 +428,17 @@ pub fn search(query: &str,
             }
             None => name
         };
-        config.shell().say(line, BLACK)?;
+        println!("{}", line);
     }
 
     let search_max_limit = 100;
     if total_crates > limit as u32 && limit < search_max_limit {
-        config.shell().say(
-            format!("... and {} crates more (use --limit N to see more)",
-                    total_crates - limit as u32),
-            BLACK)
-        ?;
+        println!("... and {} crates more (use --limit N to see more)",
+                 total_crates - limit as u32);
     } else if total_crates > limit as u32 && limit >= search_max_limit {
-        config.shell().say(
-            format!(
-                "... and {} crates more (go to http://crates.io/search?q={} to see more)",
-                total_crates - limit as u32,
-                percent_encode(query.as_bytes(), QUERY_ENCODE_SET)
-            ),
-            BLACK)
-        ?;
+        println!("... and {} crates more (go to http://crates.io/search?q={} to see more)",
+                 total_crates - limit as u32,
+                 percent_encode(query.as_bytes(), QUERY_ENCODE_SET));
     }
 
     Ok(())

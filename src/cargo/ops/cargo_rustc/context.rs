@@ -1,26 +1,31 @@
 #![allow(deprecated)]
 
 use std::collections::{HashSet, HashMap, BTreeSet};
+use std::collections::hash_map::Entry;
 use std::env;
 use std::fmt;
 use std::hash::{Hasher, Hash, SipHasher};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::sync::Arc;
+use std::cell::RefCell;
+
+use jobserver::Client;
 
 use core::{Package, PackageId, PackageSet, Resolve, Target, Profile};
 use core::{TargetKind, Profiles, Dependency, Workspace};
 use core::dependency::Kind as DepKind;
-use util::{self, CargoResult, ChainError, internal, Config, profile, Cfg, CfgExpr, human};
+use util::{self, ProcessBuilder, internal, Config, profile, Cfg, CfgExpr};
+use util::errors::{CargoResult, CargoResultExt};
 
 use super::TargetConfig;
-use super::custom_build::{BuildState, BuildScripts};
+use super::custom_build::{BuildState, BuildScripts, BuildDeps};
 use super::fingerprint::Fingerprint;
 use super::layout::Layout;
 use super::links::Links;
 use super::{Kind, Compilation, BuildConfig};
 
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Unit<'a> {
     pub pkg: &'a Package,
     pub target: &'a Target,
@@ -35,13 +40,14 @@ pub struct Context<'a, 'cfg: 'a> {
     pub compilation: Compilation<'cfg>,
     pub packages: &'a PackageSet<'cfg>,
     pub build_state: Arc<BuildState>,
-    pub build_explicit_deps: HashMap<Unit<'a>, (PathBuf, Vec<String>)>,
+    pub build_explicit_deps: HashMap<Unit<'a>, BuildDeps>,
     pub fingerprints: HashMap<Unit<'a>, Arc<Fingerprint>>,
     pub compiled: HashSet<Unit<'a>>,
     pub build_config: BuildConfig,
     pub build_scripts: HashMap<Unit<'a>, Arc<BuildScripts>>,
     pub links: Links<'a>,
     pub used_in_plugin: HashSet<Unit<'a>>,
+    pub jobserver: Client,
 
     host: Layout,
     target: Option<Layout>,
@@ -49,12 +55,31 @@ pub struct Context<'a, 'cfg: 'a> {
     host_info: TargetInfo,
     profiles: &'a Profiles,
     incremental_enabled: bool,
+    target_filenames: HashMap<Unit<'a>, Arc<Vec<(PathBuf, Option<PathBuf>, bool)>>>,
 }
 
 #[derive(Clone, Default)]
 struct TargetInfo {
-    crate_types: HashMap<String, Option<(String, String)>>,
+    crate_type_process: Option<ProcessBuilder>,
+    crate_types: RefCell<HashMap<String, Option<(String, String)>>>,
     cfg: Option<Vec<Cfg>>,
+}
+
+impl TargetInfo {
+    fn discover_crate_type(&self, crate_type: &str) -> CargoResult<Option<(String, String)>> {
+        let mut process = self.crate_type_process.clone().unwrap();
+
+        process.arg("--crate-type").arg(crate_type);
+
+        let output = process.exec_with_output().chain_err(|| {
+            format!("failed to run `rustc` to learn about \
+                     crate-type {} information", crate_type)
+        })?;
+
+        let error = str::from_utf8(&output.stderr).unwrap();
+        let output = str::from_utf8(&output.stdout).unwrap();
+        Ok(parse_crate_type(crate_type, error, &mut output.lines())?)
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +108,31 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
             Err(_) => false,
         };
 
+        // -Z can only be used on nightly builds; other builds complain loudly.
+        // Since incremental builds only work on nightly anyway, we silently
+        // ignore CARGO_INCREMENTAL on anything but nightly. This allows users
+        // to always have CARGO_INCREMENTAL set without getting unexpected
+        // errors on stable/beta builds.
+        let is_nightly =
+            config.rustc()?.verbose_version.contains("-nightly") ||
+            config.rustc()?.verbose_version.contains("-dev");
+        let incremental_enabled = incremental_enabled && is_nightly;
+
+        // Load up the jobserver that we'll use to manage our parallelism. This
+        // is the same as the GNU make implementation of a jobserver, and
+        // intentionally so! It's hoped that we can interact with GNU make and
+        // all share the same jobserver.
+        //
+        // Note that if we don't have a jobserver in our environment then we
+        // create our own, and we create it with `n-1` tokens because one token
+        // is ourself, a running process.
+        let jobserver = match config.jobserver_from_env() {
+            Some(c) => c.clone(),
+            None => Client::new(build_config.jobs as usize - 1).chain_err(|| {
+                "failed to create jobserver"
+            })?,
+        };
+
         Ok(Context {
             ws: ws,
             host: host_layout,
@@ -103,6 +153,8 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
             links: Links::new(),
             used_in_plugin: HashSet::new(),
             incremental_enabled: incremental_enabled,
+            jobserver: jobserver,
+            target_filenames: HashMap::new(),
         })
     }
 
@@ -111,12 +163,12 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
     pub fn prepare(&mut self) -> CargoResult<()> {
         let _p = profile::start("preparing layout");
 
-        self.host.prepare().chain_error(|| {
+        self.host.prepare().chain_err(|| {
             internal(format!("couldn't prepare build directories"))
         })?;
         match self.target {
             Some(ref mut target) => {
-                target.prepare().chain_error(|| {
+                target.prepare().chain_err(|| {
                     internal(format!("couldn't prepare build directories"))
                 })?;
             }
@@ -188,23 +240,27 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
                .args(&rustflags)
                .env_remove("RUST_LOG");
 
-        for crate_type in crate_types {
-            process.arg("--crate-type").arg(crate_type);
-        }
         if kind == Kind::Target {
             process.arg("--target").arg(&self.target_triple());
         }
 
+        let crate_type_process = process.clone();
+
+        for crate_type in crate_types {
+            process.arg("--crate-type").arg(crate_type);
+        }
+
         let mut with_cfg = process.clone();
+        with_cfg.arg("--print=sysroot");
         with_cfg.arg("--print=cfg");
 
-        let mut has_cfg = true;
+        let mut has_cfg_and_sysroot = true;
         let output = with_cfg.exec_with_output().or_else(|_| {
-            has_cfg = false;
+            has_cfg_and_sysroot = false;
             process.exec_with_output()
-        }).chain_error(|| {
-            human(format!("failed to run `rustc` to learn about \
-                           target-specific information"))
+        }).chain_err(|| {
+            format!("failed to run `rustc` to learn about \
+                     target-specific information")
         })?;
 
         let error = str::from_utf8(&output.stderr).unwrap();
@@ -212,32 +268,34 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         let mut lines = output.lines();
         let mut map = HashMap::new();
         for crate_type in crate_types {
-            let not_supported = error.lines().any(|line| {
-                (line.contains("unsupported crate type") ||
-                 line.contains("unknown crate type")) &&
-                line.contains(crate_type)
-            });
-            if not_supported {
-                map.insert(crate_type.to_string(), None);
-                continue;
-            }
-            let line = match lines.next() {
-                Some(line) => line,
-                None => bail!("malformed output when learning about \
-                               target-specific information from rustc"),
-            };
-            let mut parts = line.trim().split("___");
-            let prefix = parts.next().unwrap();
-            let suffix = match parts.next() {
-                Some(part) => part,
-                None => bail!("output of --print=file-names has changed in \
-                               the compiler, cannot parse"),
-            };
-
-            map.insert(crate_type.to_string(), Some((prefix.to_string(), suffix.to_string())));
+            let out = parse_crate_type(crate_type, error, &mut lines)?;
+            map.insert(crate_type.to_string(), out);
         }
 
-        let cfg = if has_cfg {
+        if has_cfg_and_sysroot {
+            let line = match lines.next() {
+                Some(line) => line,
+                None => bail!("output of --print=sysroot missing when learning about \
+                               target-specific information from rustc"),
+            };
+            let mut rustlib = PathBuf::from(line);
+            if kind == Kind::Host {
+                if cfg!(windows) {
+                    rustlib.push("bin");
+                } else {
+                    rustlib.push("lib");
+                }
+                self.compilation.host_dylib_path = Some(rustlib);
+            } else {
+                rustlib.push("lib");
+                rustlib.push("rustlib");
+                rustlib.push(self.target_triple());
+                rustlib.push("lib");
+                self.compilation.target_dylib_path = Some(rustlib);
+            }
+        }
+
+        let cfg = if has_cfg_and_sysroot {
             Some(try!(lines.map(Cfg::from_str).collect()))
         } else {
             None
@@ -247,7 +305,8 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
             Kind::Target => &mut self.target_info,
             Kind::Host => &mut self.host_info,
         };
-        info.crate_types = map;
+        info.crate_type_process = Some(crate_type_process);
+        info.crate_types = RefCell::new(map);
         info.cfg = cfg;
         Ok(())
     }
@@ -328,6 +387,11 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         self.host.deps()
     }
 
+    /// Return the root of the build output tree
+    pub fn target_root(&self) -> &Path {
+        self.host.dest()
+    }
+
     /// Returns the appropriate output directory for the specified package and
     /// target.
     pub fn out_dir(&mut self, unit: &Unit) -> PathBuf {
@@ -346,7 +410,7 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         let name = unit.pkg.package_id().name();
         match self.target_metadata(unit) {
             Some(meta) => format!("{}-{}", name, meta),
-            None => format!("{}-{}", name, util::short_hash(unit.pkg)),
+            None => format!("{}-{}", name, self.target_short_hash(unit)),
         }
     }
 
@@ -365,6 +429,13 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         self.build_config.requested_target.as_ref().map(|s| &s[..])
     }
 
+    /// Get the short hash based only on the PackageId
+    /// Used for the metadata when target_metadata returns None
+    pub fn target_short_hash(&self, unit: &Unit) -> String {
+        let hashable = unit.pkg.package_id().stable_hash(self.ws.root());
+        util::short_hash(&hashable)
+    }
+
     /// Get the metadata for a target in a specific profile
     /// We build to the path: "{filename}-{target_metadata}"
     /// We use a linking step to link/copy to a predictable filename
@@ -374,23 +445,24 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         // - OSX encodes the dylib name in the executable
         // - Windows rustc multiple files of which we can't easily link all of them
         //
-        // Two expeptions
+        // Two exceptions
         // 1) Upstream dependencies (we aren't exporting + need to resolve name conflict)
         // 2) __CARGO_DEFAULT_LIB_METADATA env var
         //
         // Note, though, that the compiler's build system at least wants
         // path dependencies (eg libstd) to have hashes in filenames. To account for
         // that we have an extra hack here which reads the
-        // `__CARGO_DEFAULT_METADATA` environment variable and creates a
+        // `__CARGO_DEFAULT_LIB_METADATA` environment variable and creates a
         // hash in the filename if that's present.
         //
         // This environment variable should not be relied on! It's
         // just here for rustbuild. We need a more principled method
         // doing this eventually.
+        let __cargo_default_lib_metadata = env::var("__CARGO_DEFAULT_LIB_METADATA");
         if !unit.profile.test &&
             (unit.target.is_dylib() || unit.target.is_cdylib()) &&
             unit.pkg.package_id().source_id().is_path() &&
-            !env::var("__CARGO_DEFAULT_LIB_METADATA").is_ok() {
+            !__cargo_default_lib_metadata.is_ok() {
             return None;
         }
 
@@ -398,7 +470,7 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
 
         // Unique metadata per (name, source, version) triple. This'll allow us
         // to pull crates from anywhere w/o worrying about conflicts
-        unit.pkg.package_id().hash(&mut hasher);
+        unit.pkg.package_id().stable_hash(self.ws.root()).hash(&mut hasher);
 
         // Add package properties which map to environment variables
         // exposed by Cargo
@@ -416,10 +488,25 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         // settings like debuginfo and whatnot.
         unit.profile.hash(&mut hasher);
 
+        // Artifacts compiled for the host should have a different metadata
+        // piece than those compiled for the target, so make sure we throw in
+        // the unit's `kind` as well
+        unit.kind.hash(&mut hasher);
+
         // Finally throw in the target name/kind. This ensures that concurrent
         // compiles of targets in the same crate don't collide.
         unit.target.name().hash(&mut hasher);
         unit.target.kind().hash(&mut hasher);
+
+        if let Ok(ref rustc) = self.config.rustc() {
+            rustc.verbose_version.hash(&mut hasher);
+        }
+
+        // Seed the contents of __CARGO_DEFAULT_LIB_METADATA to the hasher if present.
+        // This should be the release channel, to get a different hash for each channel.
+        if let Ok(ref channel) = __cargo_default_lib_metadata {
+            channel.hash(&mut hasher);
+        }
 
         Some(Metadata(hasher.finish()))
     }
@@ -485,8 +572,12 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
     /// filename: filename rustc compiles to. (Often has metadata suffix).
     /// link_dst: Optional file to link/copy the result to (without metadata suffix)
     /// linkable: Whether possible to link against file (eg it's a library)
-    pub fn target_filenames(&mut self, unit: &Unit)
-                            -> CargoResult<Vec<(PathBuf, Option<PathBuf>, bool)>> {
+    pub fn target_filenames(&mut self, unit: &Unit<'a>)
+                            -> CargoResult<Arc<Vec<(PathBuf, Option<PathBuf>, bool)>>> {
+        if let Some(cache) = self.target_filenames.get(unit) {
+            return Ok(cache.clone())
+        }
+
         let out_dir = self.out_dir(unit);
         let stem = self.file_stem(unit);
         let link_stem = self.link_stem(unit);
@@ -508,8 +599,17 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
             } else {
                 let mut add = |crate_type: &str, linkable: bool| -> CargoResult<()> {
                     let crate_type = if crate_type == "lib" {"rlib"} else {crate_type};
-                    match info.crate_types.get(crate_type) {
-                        Some(&Some((ref prefix, ref suffix))) => {
+                    let mut crate_types = info.crate_types.borrow_mut();
+                    let entry = crate_types.entry(crate_type.to_string());
+                    let crate_type_info = match entry {
+                        Entry::Occupied(o) => &*o.into_mut(),
+                        Entry::Vacant(v) => {
+                            let value = info.discover_crate_type(&v.key())?;
+                            &*v.insert(value)
+                        }
+                    };
+                    match *crate_type_info {
+                        Some((ref prefix, ref suffix)) => {
                             let filename = out_dir.join(format!("{}{}{}", prefix, stem, suffix));
                             let link_dst = link_stem.clone().map(|(ld, ls)| {
                                 ld.join(format!("{}{}{}", prefix, ls, suffix))
@@ -518,13 +618,9 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
                             Ok(())
                         }
                         // not supported, don't worry about it
-                        Some(&None) => {
+                        None => {
                             unsupported.push(crate_type.to_string());
                             Ok(())
-                        }
-                        None => {
-                            bail!("failed to learn about crate-type `{}` early on",
-                                  crate_type)
                         }
                     }
                 };
@@ -562,6 +658,9 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
                   unit.pkg, self.target_triple());
         }
         info!("Target filenames: {:?}", ret);
+
+        let ret = Arc::new(ret);
+        self.target_filenames.insert(*unit, ret.clone());
         Ok(ret)
     }
 
@@ -866,10 +965,25 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
 
     pub fn incremental_args(&self, unit: &Unit) -> CargoResult<Vec<String>> {
         if self.incremental_enabled {
-            Ok(vec![format!("-Zincremental={}", self.layout(unit.kind).incremental().display())])
-        } else {
-            Ok(vec![])
+            if unit.pkg.package_id().source_id().is_path() {
+                // Only enable incremental compilation for sources the user can modify.
+                // For things that change infrequently, non-incremental builds yield
+                // better performance.
+                // (see also https://github.com/rust-lang/cargo/issues/3972)
+                return Ok(vec![format!("-Zincremental={}",
+                                       self.layout(unit.kind).incremental().display())]);
+            } else {
+                if unit.profile.codegen_units.is_none() {
+                    // For non-incremental builds we set a higher number of
+                    // codegen units so we get faster compiles. It's OK to do
+                    // so because the user has already opted into slower
+                    // runtime code by setting CARGO_INCREMENTAL.
+                    return Ok(vec![format!("-Ccodegen-units={}", ::num_cpus::get())]);
+                }
+            }
         }
+
+        Ok(vec![])
     }
 
     pub fn rustflags_args(&self, unit: &Unit) -> CargoResult<Vec<String>> {
@@ -950,11 +1064,18 @@ fn env_args(config: &Config,
     // ...including target.'cfg(...)'.rustflags
     if let Some(ref target_cfg) = target_info.cfg {
         if let Some(table) = config.get_table("target")? {
-            let cfgs = table.val.iter().map(|(t, _)| (CfgExpr::from_str(t), t))
-                .filter_map(|(c, n)| c.map(|c| (c, n)).ok())
-                .filter(|&(ref c, _)| c.matches(target_cfg));
-            for (_, n) in cfgs {
-                let key = format!("target.'{}'.{}", n, name);
+            let cfgs = table.val.keys().filter_map(|t| {
+                if t.starts_with("cfg(") && t.ends_with(")") {
+                    let cfg = &t[4..t.len() - 1];
+                    CfgExpr::from_str(cfg)
+                        .ok()
+                        .and_then(|c| if c.matches(target_cfg) { Some(t) } else { None })
+                } else {
+                    None
+                }
+            });
+            for n in cfgs {
+                let key = format!("target.{}.{}", n, name);
                 if let Some(args) = config.get_list_or_split_string(&key)? {
                     let args = args.val.into_iter();
                     rustflags.extend(args);
@@ -981,4 +1102,33 @@ impl fmt::Display for Metadata {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:016x}", self.0)
     }
+}
+
+fn parse_crate_type(
+    crate_type: &str,
+    error: &str,
+    lines: &mut str::Lines,
+) -> CargoResult<Option<(String, String)>> {
+    let not_supported = error.lines().any(|line| {
+        (line.contains("unsupported crate type") ||
+         line.contains("unknown crate type")) &&
+        line.contains(crate_type)
+    });
+    if not_supported {
+        return Ok(None);
+    }
+    let line = match lines.next() {
+        Some(line) => line,
+        None => bail!("malformed output when learning about \
+            crate-type {} information", crate_type),
+    };
+    let mut parts = line.trim().split("___");
+    let prefix = parts.next().unwrap();
+    let suffix = match parts.next() {
+        Some(part) => part,
+        None => bail!("output of --print=file-names has changed in \
+            the compiler, cannot parse"),
+    };
+
+    Ok(Some((prefix.to_string(), suffix.to_string())))
 }

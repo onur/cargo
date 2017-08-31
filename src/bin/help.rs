@@ -1,6 +1,6 @@
-use cargo::util::{CliResult, CliError, Config, human};
+use cargo::util::{CliResult, CliError, Config};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Options;
 
 pub const USAGE: &'static str = "
@@ -18,5 +18,5 @@ pub fn execute(_: Options, _: &Config) -> CliResult {
     // This is a dummy command just so that `cargo help help` works.
     // The actual delegation of help flag to subcommands is handled by the
     // cargo command.
-    Err(CliError::new(human("help command should not be executed directly"), 101))
+    Err(CliError::new("help command should not be executed directly".into(), 101))
 }

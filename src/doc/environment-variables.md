@@ -22,6 +22,9 @@ system:
   invocation, with the first argument being rustc.
 * `RUSTDOC` - Instead of running `rustdoc`, Cargo will execute this specified
   `rustdoc` instance instead.
+* `RUSTDOCFLAGS` - A space-separated list of custom flags to pass to all `rustdoc`
+  invocations that Cargo performs. In contrast with `cargo rustdoc`, this is
+  useful for passing a flag to *all* `rustdoc` instances.
 * `RUSTFLAGS` - A space-separated list of custom flags to pass to all compiler
   invocations that Cargo performs. In contrast with `cargo rustc`, this is
   useful for passing a flag to *all* compiler instances.
@@ -80,6 +83,15 @@ let out_dir = env::var("OUT_DIR").unwrap();
                            built, this environment variable will be present
                            where `<name>` is the name of the feature uppercased
                            and having `-` translated to `_`.
+* `CARGO_CFG_<cfg>` - For each [configuration option][configuration] of the
+                      package being built, this environment variable will
+                      contain the value of the configuration, where `<cfg>` is
+                      the name of the configuration uppercased and having `-`
+                      translated to `_`.
+                      Boolean configurations are present if they are set, and
+                      not present otherwise.
+                      Configurations with multiple values are joined to a
+                      single variable with the values delimited by `,`.
 * `OUT_DIR` - the folder in which all output should be placed. This folder is
               inside the build directory for the package being built, and it is
               unique for the package in question.
@@ -88,7 +100,14 @@ let out_dir = env::var("OUT_DIR").unwrap();
              triples can be found in [clang’s own documentation][clang].
 * `HOST` - the host triple of the rust compiler.
 * `NUM_JOBS` - the parallelism specified as the top-level parallelism. This can
-               be useful to pass a `-j` parameter to a system like `make`.
+               be useful to pass a `-j` parameter to a system like `make`. Note
+               that care should be taken when interpreting this environment
+               variable. For historical purposes this is still provided but
+               recent versions of Cargo, for example, do not need to run `make
+               -j` as it'll automatically happen. Cargo implements its own
+               [jobserver] and will allow build scripts to inherit this
+               information, so programs compatible with GNU make jobservers will
+               already have appropriately configured parallelism.
 * `OPT_LEVEL`, `DEBUG` - values of the corresponding variables for the
                          profile currently being built.
 * `PROFILE` - `release` for release builds, `debug` for other builds.
@@ -100,7 +119,9 @@ let out_dir = env::var("OUT_DIR").unwrap();
 
 [links]: build-script.html#the-links-manifest-key
 [profile]: manifest.html#the-profile-sections
+[configuration]: https://doc.rust-lang.org/reference/attributes.html#conditional-compilation
 [clang]:http://clang.llvm.org/docs/CrossCompilation.html#target-triple
+[jobserver]: http://make.mad-scientist.net/papers/jobserver-implementation/
 
 # Environment variables Cargo sets for 3rd party subcommands
 

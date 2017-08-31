@@ -1,5 +1,6 @@
 extern crate cargotest;
 extern crate hamcrest;
+extern crate cargo;
 
 use std::str;
 use std::fs;
@@ -8,6 +9,7 @@ use cargotest::rustc_host;
 use cargotest::support::{project, execs, path2url};
 use cargotest::support::registry::Package;
 use hamcrest::{assert_that, existing_file, existing_dir, is_not};
+use cargo::util::{CargoError, CargoErrorKind};
 
 #[test]
 fn simple() {
@@ -357,11 +359,16 @@ fn output_not_captured() {
             pub fn foo() {}
         ");
 
-    let output = p.cargo_process("doc").exec_with_output().err().unwrap()
-                                                          .output.unwrap();
-    let stderr = str::from_utf8(&output.stderr).unwrap();
-    assert!(stderr.contains("☃"), "no snowman\n{}", stderr);
-    assert!(stderr.contains("unknown start of token"), "no message\n{}", stderr);
+    let error = p.cargo_process("doc").exec_with_output().err().unwrap();
+    if let CargoError(CargoErrorKind::ProcessErrorKind(perr), ..) = error {
+        let output = perr.output.unwrap();
+        let stderr = str::from_utf8(&output.stderr).unwrap();
+    
+        assert!(stderr.contains("☃"), "no snowman\n{}", stderr);
+        assert!(stderr.contains("unknown start of token"), "no message{}", stderr);
+    } else {
+        assert!(false, "an error kind other than ProcessErrorKind was encountered");
+    }
 }
 
 #[test]
@@ -680,6 +687,37 @@ fn doc_all_virtual_manifest() {
     // The order in which foo and bar are documented is not guaranteed
     assert_that(p.cargo_process("doc")
                  .arg("--all"),
+                execs().with_status(0)
+                       .with_stderr_contains("[..] Documenting bar v0.1.0 ([..])")
+                       .with_stderr_contains("[..] Documenting foo v0.1.0 ([..])"));
+}
+
+#[test]
+fn doc_virtual_manifest_all_implied() {
+    let p = project("workspace")
+        .file("Cargo.toml", r#"
+            [workspace]
+            members = ["foo", "bar"]
+        "#)
+        .file("foo/Cargo.toml", r#"
+            [project]
+            name = "foo"
+            version = "0.1.0"
+        "#)
+        .file("foo/src/lib.rs", r#"
+            pub fn foo() {}
+        "#)
+        .file("bar/Cargo.toml", r#"
+            [project]
+            name = "bar"
+            version = "0.1.0"
+        "#)
+        .file("bar/src/lib.rs", r#"
+            pub fn bar() {}
+        "#);
+
+    // The order in which foo and bar are documented is not guaranteed
+    assert_that(p.cargo_process("doc"),
                 execs().with_status(0)
                        .with_stderr_contains("[..] Documenting bar v0.1.0 ([..])")
                        .with_stderr_contains("[..] Documenting foo v0.1.0 ([..])"));
