@@ -981,7 +981,7 @@ fn build_deps_args<'a, 'cfg>(
 
             use rustc_version::{version_meta, Channel};
             if version_meta().unwrap().channel == Channel::Dev {
-                cmd.arg("-Z unstable-options --extern-html-root-url {}={},{}")
+                cmd.arg("-Z unstable-options --extern-html-root-url")
                    .arg(&format!("{}=https://docs.rs/{}/{}",
                                  name,
                                  dep.target.crate_name(),
