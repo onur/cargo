@@ -1,63 +1,84 @@
-#![deny(unused)]
 #![cfg_attr(test, deny(warnings))]
-#![recursion_limit="128"]
 
-#[macro_use] extern crate error_chain;
-#[macro_use] extern crate log;
-#[macro_use] extern crate scoped_tls;
-#[macro_use] extern crate serde_derive;
-#[macro_use] extern crate serde_json;
+// Clippy isn't enforced by CI, and know that @alexcrichton isn't a fan :)
+#![cfg_attr(feature = "cargo-clippy", allow(boxed_local))]             // bug rust-lang-nursery/rust-clippy#1123
+#![cfg_attr(feature = "cargo-clippy", allow(cyclomatic_complexity))]   // large project
+#![cfg_attr(feature = "cargo-clippy", allow(derive_hash_xor_eq))]      // there's an intentional incoherence
+#![cfg_attr(feature = "cargo-clippy", allow(explicit_into_iter_loop))] // explicit loops are clearer
+#![cfg_attr(feature = "cargo-clippy", allow(explicit_iter_loop))]      // explicit loops are clearer
+#![cfg_attr(feature = "cargo-clippy", allow(identity_op))]             // used for vertical alignment
+#![cfg_attr(feature = "cargo-clippy", allow(implicit_hasher))]         // large project
+#![cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]      // large project
+#![cfg_attr(feature = "cargo-clippy", allow(redundant_closure_call))]  // closures over try catch blocks
+#![cfg_attr(feature = "cargo-clippy", allow(too_many_arguments))]      // large project
+#![cfg_attr(feature = "cargo-clippy", allow(type_complexity))]         // there's an exceptionally complex type
+#![cfg_attr(feature = "cargo-clippy", allow(wrong_self_convention))]   // perhaps Rc should be special cased in Clippy?
+
 extern crate atty;
+extern crate clap;
+#[cfg(target_os = "macos")]
+extern crate core_foundation;
 extern crate crates_io as registry;
-extern crate crossbeam;
+extern crate crossbeam_utils;
 extern crate curl;
-extern crate docopt;
+#[macro_use]
+extern crate failure;
 extern crate filetime;
 extern crate flate2;
 extern crate fs2;
+#[cfg(windows)]
+extern crate fwdansi;
 extern crate git2;
 extern crate glob;
 extern crate hex;
 extern crate home;
 extern crate ignore;
 extern crate jobserver;
+#[macro_use]
+extern crate lazy_static;
+extern crate lazycell;
 extern crate libc;
 extern crate libgit2_sys;
+#[macro_use]
+extern crate log;
 extern crate num_cpus;
+extern crate opener;
+extern crate rustfix;
 extern crate same_file;
 extern crate semver;
+#[macro_use]
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_ignored;
+#[macro_use]
+extern crate serde_json;
 extern crate shell_escape;
 extern crate tar;
-extern crate tempdir;
+extern crate tempfile;
 extern crate termcolor;
 extern crate toml;
+extern crate unicode_width;
 extern crate url;
 extern crate rustc_version;
 #[cfg(target_os = "macos")]
 extern crate core_foundation;
 
 use std::fmt;
-use std::error::Error;
 
-use error_chain::ChainedError;
-use serde::Deserialize;
 use serde::ser;
-use docopt::Docopt;
+use failure::Error;
 
 use core::Shell;
 use core::shell::Verbosity::Verbose;
 
-pub use util::{CargoError, CargoErrorKind, CargoResult, CliError, CliResult, Config};
+pub use util::{CargoError, CargoResult, CliError, CliResult, Config};
+pub use util::errors::Internal;
 
-pub const CARGO_ENV: &'static str = "CARGO";
+pub const CARGO_ENV: &str = "CARGO";
 
-macro_rules! bail {
-    ($($fmt:tt)*) => (
-        return Err(::util::errors::CargoError::from(format_args!($($fmt)*).to_string()))
-    )
-}
+#[macro_use]
+mod macros;
 
 pub mod core;
 pub mod ops;
@@ -78,9 +99,9 @@ pub struct CfgInfo {
 }
 
 pub struct VersionInfo {
-    pub major: String,
-    pub minor: String,
-    pub patch: String,
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
     pub pre_release: Option<String>,
     // Information that's only available when we were built with
     // configure/make, rather than cargo itself.
@@ -89,44 +110,22 @@ pub struct VersionInfo {
 
 impl fmt::Display for VersionInfo {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "cargo {}.{}.{}",
-               self.major, self.minor, self.patch)?;
+        write!(f, "cargo {}.{}.{}", self.major, self.minor, self.patch)?;
         if let Some(channel) = self.cfg_info.as_ref().map(|ci| &ci.release_channel) {
             if channel != "stable" {
                 write!(f, "-{}", channel)?;
-                let empty = String::from("");
+                let empty = String::new();
                 write!(f, "{}", self.pre_release.as_ref().unwrap_or(&empty))?;
             }
         };
 
         if let Some(ref cfg) = self.cfg_info {
             if let Some(ref ci) = cfg.commit_info {
-                write!(f, " ({} {})",
-                       ci.short_commit_hash, ci.commit_date)?;
+                write!(f, " ({} {})", ci.short_commit_hash, ci.commit_date)?;
             }
         };
         Ok(())
     }
-}
-
-pub fn call_main_without_stdin<'de, Flags: Deserialize<'de>>(
-            exec: fn(Flags, &Config) -> CliResult,
-            config: &Config,
-            usage: &str,
-            args: &[String],
-            options_first: bool) -> CliResult
-{
-    let docopt = Docopt::new(usage).unwrap()
-        .options_first(options_first)
-        .argv(args.iter().map(|s| &s[..]))
-        .help(true);
-
-    let flags = docopt.deserialize().map_err(|e| {
-        let code = if e.fatal() {1} else {0};
-        CliError::new(e.to_string().into(), code)
-    })?;
-
-    exec(flags, config)
 }
 
 pub fn print_json<T: ser::Serialize>(obj: &T) {
@@ -136,8 +135,17 @@ pub fn print_json<T: ser::Serialize>(obj: &T) {
 
 pub fn exit_with_error(err: CliError, shell: &mut Shell) -> ! {
     debug!("exit_with_error; err={:?}", err);
+    if let Some(ref err) = err.error {
+        if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
+            clap_err.exit()
+        }
+    }
 
-    let CliError { error, exit_code, unknown } = err;
+    let CliError {
+        error,
+        exit_code,
+        unknown,
+    } = err;
     // exit_code == 0 is non-fatal error, e.g. docopt version info
     let fatal = exit_code != 0;
 
@@ -149,64 +157,51 @@ pub fn exit_with_error(err: CliError, shell: &mut Shell) -> ! {
         } else if fatal {
             drop(shell.error(&error))
         } else {
-            drop(writeln!(shell.err(), "{}", error))
+            println!("{}", error);
         }
 
-        if !handle_cause(error, shell) || hide {
-            drop(writeln!(shell.err(), "\nTo learn more, run the command again \
-                                        with --verbose."));
+        if !handle_cause(&error, shell) || hide {
+            drop(writeln!(
+                shell.err(),
+                "\nTo learn more, run the command again \
+                 with --verbose."
+            ));
         }
     }
 
     std::process::exit(exit_code)
 }
 
-pub fn handle_error(err: CargoError, shell: &mut Shell) {
-    debug!("handle_error; err={:?}", &err);
+pub fn handle_error(err: &CargoError, shell: &mut Shell) {
+    debug!("handle_error; err={:?}", err);
 
-    let _ignored_result = shell.error(&err);
+    let _ignored_result = shell.error(err);
     handle_cause(err, shell);
 }
 
-fn handle_cause<E, EKind>(cargo_err: E, shell: &mut Shell) -> bool
-    where E: ChainedError<ErrorKind=EKind> + 'static
-{
-    fn print(error: String, shell: &mut Shell) {
+fn handle_cause(cargo_err: &Error, shell: &mut Shell) -> bool {
+    fn print(error: &str, shell: &mut Shell) {
         drop(writeln!(shell.err(), "\nCaused by:"));
         drop(writeln!(shell.err(), "  {}", error));
-    }
-
-    //Error inspection in non-verbose mode requires inspecting the
-    //error kind to avoid printing Internal errors. The downcasting
-    //machinery requires &(Error + 'static), but the iterator (and
-    //underlying `cause`) return &Error. Because the borrows are
-    //constrained to this handling method, and because the original
-    //error object is constrained to be 'static, we're casting away
-    //the borrow's actual lifetime for purposes of downcasting and
-    //inspecting the error chain
-    unsafe fn extend_lifetime(r: &Error) -> &(Error + 'static) {
-        std::mem::transmute::<&Error, &Error>(r)
     }
 
     let verbose = shell.verbosity();
 
     if verbose == Verbose {
-        //The first error has already been printed to the shell
-        //Print all remaining errors
-        for err in cargo_err.iter().skip(1) {
-            print(err.to_string(), shell);
+        // The first error has already been printed to the shell
+        // Print all remaining errors
+        for err in cargo_err.iter_causes() {
+            print(&err.to_string(), shell);
         }
     } else {
-        //The first error has already been printed to the shell
-        //Print remaining errors until one marked as Internal appears
-        for err in cargo_err.iter().skip(1) {
-            let err = unsafe { extend_lifetime(err) };
-            if let Some(&CargoError(CargoErrorKind::Internal(..), ..)) =
-                err.downcast_ref::<CargoError>() {
+        // The first error has already been printed to the shell
+        // Print remaining errors until one marked as Internal appears
+        for err in cargo_err.iter_causes() {
+            if err.downcast_ref::<Internal>().is_some() {
                 return false;
             }
 
-            print(err.to_string(), shell);
+            print(&err.to_string(), shell);
         }
     }
 
@@ -214,43 +209,54 @@ fn handle_cause<E, EKind>(cargo_err: E, shell: &mut Shell) -> bool
 }
 
 pub fn version() -> VersionInfo {
-    macro_rules! env_str {
-        ($name:expr) => { env!($name).to_string() }
-    }
     macro_rules! option_env_str {
         ($name:expr) => { option_env!($name).map(|s| s.to_string()) }
     }
+
+    // So this is pretty horrible...
+    // There are two versions at play here:
+    //   - version of cargo-the-binary, which you see when you type `cargo --version`
+    //   - version of cargo-the-library, which you download from crates.io for use
+    //     in your projects.
+    //
+    // We want to make the `binary` version the same as the corresponding Rust/rustc release.
+    // At the same time, we want to keep the library version at `0.x`, because Cargo as
+    // a library is (and probably will always be) unstable.
+    //
+    // Historically, Cargo used the same version number for both the binary and the library.
+    // Specifically, rustc 1.x.z was paired with cargo 0.x+1.w.
+    // We continue to use this scheme for the library, but transform it to 1.x.w for the purposes
+    // of `cargo --version`.
+    let major = 1;
+    let minor = env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap() - 1;
+    let patch = env!("CARGO_PKG_VERSION_PATCH").parse::<u8>().unwrap();
+
     match option_env!("CFG_RELEASE_CHANNEL") {
         // We have environment variables set up from configure/make.
         Some(_) => {
-            let commit_info =
-                option_env!("CFG_COMMIT_HASH").map(|s| {
-                    CommitInfo {
-                        commit_hash: s.to_string(),
-                        short_commit_hash: option_env_str!("CFG_SHORT_COMMIT_HASH").unwrap(),
-                        commit_date: option_env_str!("CFG_COMMIT_DATE").unwrap(),
-                    }
-                });
+            let commit_info = option_env!("CFG_COMMIT_HASH").map(|s| CommitInfo {
+                commit_hash: s.to_string(),
+                short_commit_hash: option_env_str!("CFG_SHORT_COMMIT_HASH").unwrap(),
+                commit_date: option_env_str!("CFG_COMMIT_DATE").unwrap(),
+            });
             VersionInfo {
-                major: env_str!("CARGO_PKG_VERSION_MAJOR"),
-                minor: env_str!("CARGO_PKG_VERSION_MINOR"),
-                patch: env_str!("CARGO_PKG_VERSION_PATCH"),
+                major,
+                minor,
+                patch,
                 pre_release: option_env_str!("CARGO_PKG_VERSION_PRE"),
                 cfg_info: Some(CfgInfo {
                     release_channel: option_env_str!("CFG_RELEASE_CHANNEL").unwrap(),
-                    commit_info: commit_info,
+                    commit_info,
                 }),
             }
-        },
-        // We are being compiled by Cargo itself.
-        None => {
-            VersionInfo {
-                major: env_str!("CARGO_PKG_VERSION_MAJOR"),
-                minor: env_str!("CARGO_PKG_VERSION_MINOR"),
-                patch: env_str!("CARGO_PKG_VERSION_PATCH"),
-                pre_release: option_env_str!("CARGO_PKG_VERSION_PRE"),
-                cfg_info: None,
-            }
         }
+        // We are being compiled by Cargo itself.
+        None => VersionInfo {
+            major,
+            minor,
+            patch,
+            pre_release: option_env_str!("CARGO_PKG_VERSION_PRE"),
+            cfg_info: None,
+        },
     }
 }

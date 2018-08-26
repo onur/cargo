@@ -6,37 +6,40 @@ use semver::VersionReq;
 use semver::ReqParseError;
 use serde::ser;
 
-use core::{SourceId, Summary, PackageId};
+use core::{PackageId, SourceId, Summary};
+use core::interning::InternedString;
 use util::{Cfg, CfgExpr, Config};
-use util::errors::{CargoResult, CargoResultExt, CargoError};
+use util::errors::{CargoError, CargoResult, CargoResultExt};
 
 /// Information about a dependency requested by a Cargo manifest.
 /// Cheap to copy.
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Hash, Ord, PartialOrd, Clone, Debug)]
 pub struct Dependency {
     inner: Rc<Inner>,
 }
 
 /// The data underlying a Dependency.
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Hash, Ord, PartialOrd, Clone, Debug)]
 struct Inner {
-    name: String,
+    name: InternedString,
     source_id: SourceId,
+    registry_id: Option<SourceId>,
     req: VersionReq,
     specified_req: bool,
     kind: Kind,
     only_match_name: bool,
+    rename: Option<InternedString>,
 
     optional: bool,
     default_features: bool,
-    features: Vec<String>,
+    features: Vec<InternedString>,
 
     // This dependency should be used only for this platform.
     // `None` means *all platforms*.
     platform: Option<Platform>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Clone, Debug)]
 pub enum Platform {
     Name(String),
     Cfg(CfgExpr),
@@ -48,40 +51,44 @@ struct SerializedDependency<'a> {
     source: &'a SourceId,
     req: String,
     kind: Kind,
+    rename: Option<&'a str>,
 
     optional: bool,
     uses_default_features: bool,
-    features: &'a [String],
+    features: &'a [InternedString],
     target: Option<&'a Platform>,
 }
 
 impl ser::Serialize for Dependency {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-        where S: ser::Serializer,
+    where
+        S: ser::Serializer,
     {
         SerializedDependency {
-            name: self.name(),
-            source: &self.source_id(),
+            name: &*self.package_name(),
+            source: self.source_id(),
             req: self.version_req().to_string(),
             kind: self.kind(),
             optional: self.is_optional(),
             uses_default_features: self.uses_default_features(),
             features: self.features(),
             target: self.platform(),
+            rename: self.rename().map(|s| s.as_str()),
         }.serialize(s)
     }
 }
 
-#[derive(PartialEq, Clone, Debug, Copy)]
+#[derive(PartialEq, Eq, Hash, Ord, PartialOrd, Clone, Debug, Copy)]
 pub enum Kind {
     Normal,
     Development,
     Build,
 }
 
-fn parse_req_with_deprecated(req: &str,
-                             extra: Option<(&PackageId, &Config)>)
-                             -> CargoResult<VersionReq> {
+fn parse_req_with_deprecated(
+    req: &str,
+    extra: Option<(&PackageId, &Config)>,
+) -> CargoResult<VersionReq> {
     match VersionReq::parse(req) {
         Err(e) => {
             let (inside, config) = match extra {
@@ -90,7 +97,8 @@ fn parse_req_with_deprecated(req: &str,
             };
             match e {
                 ReqParseError::DeprecatedVersionRequirement(requirement) => {
-                    let msg = format!("\
+                    let msg = format!(
+                        "\
 parsed version requirement `{}` is no longer valid
 
 Previous versions of Cargo accepted this malformed requirement,
@@ -101,21 +109,26 @@ This will soon become a hard error, so it's either recommended to
 update to a fixed version or contact the upstream maintainer about
 this warning.
 ",
-req, inside.name(), inside.version(), requirement);
+                        req,
+                        inside.name(),
+                        inside.version(),
+                        requirement
+                    );
                     config.shell().warn(&msg)?;
 
                     Ok(requirement)
                 }
                 e => Err(e.into()),
             }
-        },
+        }
         Ok(v) => Ok(v),
     }
 }
 
 impl ser::Serialize for Kind {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-        where S: ser::Serializer,
+    where
+        S: ser::Serializer,
     {
         match *self {
             Kind::Normal => None,
@@ -127,15 +140,17 @@ impl ser::Serialize for Kind {
 
 impl Dependency {
     /// Attempt to create a `Dependency` from an entry in the manifest.
-    pub fn parse(name: &str,
-                 version: Option<&str>,
-                 source_id: &SourceId,
-                 inside: &PackageId,
-                 config: &Config) -> CargoResult<Dependency> {
+    pub fn parse(
+        name: &str,
+        version: Option<&str>,
+        source_id: &SourceId,
+        inside: &PackageId,
+        config: &Config,
+    ) -> CargoResult<Dependency> {
         let arg = Some((inside, config));
         let (specified_req, version_req) = match version {
             Some(v) => (true, parse_req_with_deprecated(v, arg)?),
-            None => (false, VersionReq::any())
+            None => (false, VersionReq::any()),
         };
 
         let mut ret = Dependency::new_override(name, source_id);
@@ -149,12 +164,14 @@ impl Dependency {
     }
 
     /// Attempt to create a `Dependency` from an entry in the manifest.
-    pub fn parse_no_deprecated(name: &str,
-                               version: Option<&str>,
-                               source_id: &SourceId) -> CargoResult<Dependency> {
+    pub fn parse_no_deprecated(
+        name: &str,
+        version: Option<&str>,
+        source_id: &SourceId,
+    ) -> CargoResult<Dependency> {
         let (specified_req, version_req) = match version {
             Some(v) => (true, parse_req_with_deprecated(v, None)?),
-            None => (false, VersionReq::any())
+            None => (false, VersionReq::any()),
         };
 
         let mut ret = Dependency::new_override(name, source_id);
@@ -168,10 +185,12 @@ impl Dependency {
     }
 
     pub fn new_override(name: &str, source_id: &SourceId) -> Dependency {
+        assert!(!name.is_empty());
         Dependency {
             inner: Rc::new(Inner {
-                name: name.to_string(),
+                name: InternedString::new(name),
                 source_id: source_id.clone(),
+                registry_id: None,
                 req: VersionReq::any(),
                 kind: Kind::Normal,
                 only_match_name: true,
@@ -180,6 +199,7 @@ impl Dependency {
                 default_features: true,
                 specified_req: false,
                 platform: None,
+                rename: None,
             }),
         }
     }
@@ -188,12 +208,63 @@ impl Dependency {
         &self.inner.req
     }
 
-    pub fn name(&self) -> &str {
-        &self.inner.name
+    /// This is the name of this `Dependency` as listed in `Cargo.toml`.
+    ///
+    /// Or in other words, this is what shows up in the `[dependencies]` section
+    /// on the left hand side. This is **not** the name of the package that's
+    /// being depended on as the dependency can be renamed. For that use
+    /// `package_name` below.
+    ///
+    /// Both of the dependencies below return `foo` for `name_in_toml`:
+    ///
+    /// ```toml
+    /// [dependencies]
+    /// foo = "0.1"
+    /// ```
+    ///
+    /// and ...
+    ///
+    /// ```toml
+    /// [dependencies]
+    /// foo = { version = "0.1", package = 'bar' }
+    /// ```
+    pub fn name_in_toml(&self) -> InternedString {
+        self.rename().unwrap_or(self.inner.name)
+    }
+
+    /// The name of the package that this `Dependency` depends on.
+    ///
+    /// Usually this is what's written on the left hand side of a dependencies
+    /// section, but it can also be renamed via the `package` key.
+    ///
+    /// Both of the dependencies below return `foo` for `package_name`:
+    ///
+    /// ```toml
+    /// [dependencies]
+    /// foo = "0.1"
+    /// ```
+    ///
+    /// and ...
+    ///
+    /// ```toml
+    /// [dependencies]
+    /// bar = { version = "0.1", package = 'foo' }
+    /// ```
+    pub fn package_name(&self) -> InternedString {
+        self.inner.name
     }
 
     pub fn source_id(&self) -> &SourceId {
         &self.inner.source_id
+    }
+
+    pub fn registry_id(&self) -> Option<&SourceId> {
+        self.inner.registry_id.as_ref()
+    }
+
+    pub fn set_registry_id(&mut self, registry_id: &SourceId) -> &mut Dependency {
+        Rc::make_mut(&mut self.inner).registry_id = Some(registry_id.clone());
+        self
     }
 
     pub fn kind(&self) -> Kind {
@@ -210,14 +281,23 @@ impl Dependency {
         self.inner.platform.as_ref()
     }
 
+    /// The renamed name of this dependency, if any.
+    ///
+    /// If the `package` key is used in `Cargo.toml` then this returns the same
+    /// value as `name_in_toml`.
+    pub fn rename(&self) -> Option<InternedString> {
+        self.inner.rename
+    }
+
     pub fn set_kind(&mut self, kind: Kind) -> &mut Dependency {
         Rc::make_mut(&mut self.inner).kind = kind;
         self
     }
 
     /// Sets the list of features requested for the package.
-    pub fn set_features(&mut self, features: Vec<String>) -> &mut Dependency {
-        Rc::make_mut(&mut self.inner).features = features;
+    pub fn set_features(&mut self, features: impl IntoIterator<Item=impl AsRef<str>>) -> &mut Dependency {
+        Rc::make_mut(&mut self.inner).features =
+            features.into_iter().map(|s| InternedString::new(s.as_ref())).collect();
         self
     }
 
@@ -250,10 +330,22 @@ impl Dependency {
         self
     }
 
+    pub fn set_rename(&mut self, rename: &str) -> &mut Dependency {
+        Rc::make_mut(&mut self.inner).rename = Some(InternedString::new(rename));
+        self
+    }
+
     /// Lock this dependency to depending on the specified package id
     pub fn lock_to(&mut self, id: &PackageId) -> &mut Dependency {
         assert_eq!(self.inner.source_id, *id.source_id());
         assert!(self.inner.req.matches(id.version()));
+        trace!(
+            "locking dep from `{}` with `{}` at {} to {}",
+            self.package_name(),
+            self.version_req(),
+            self.source_id(),
+            id
+        );
         self.set_version_req(VersionReq::exact(id.version()))
             .set_source_id(id.source_id().clone())
     }
@@ -262,7 +354,7 @@ impl Dependency {
     /// an exact version req.
     pub fn is_locked(&self) -> bool {
         // Kind of a hack to figure this out, but it works!
-        self.inner.req.to_string().starts_with("=")
+        self.inner.req.to_string().starts_with('=')
     }
 
     /// Returns false if the dependency is only used to build the local package.
@@ -289,7 +381,7 @@ impl Dependency {
         self.inner.default_features
     }
     /// Returns the list of features that are requested by the dependency.
-    pub fn features(&self) -> &[String] {
+    pub fn features(&self) -> &[InternedString] {
         &self.inner.features
     }
 
@@ -299,20 +391,19 @@ impl Dependency {
     }
 
     /// Returns true if the package (`sum`) can fulfill this dependency request.
-    pub fn matches_ignoring_source(&self, sum: &Summary) -> bool {
-        self.name() == sum.package_id().name() &&
-            self.version_req().matches(sum.package_id().version())
+    pub fn matches_ignoring_source(&self, id: &PackageId) -> bool {
+        self.package_name() == id.name() && self.version_req().matches(id.version())
     }
 
     /// Returns true if the package (`id`) can fulfill this dependency request.
     pub fn matches_id(&self, id: &PackageId) -> bool {
-        self.inner.name == id.name() &&
-            (self.inner.only_match_name || (self.inner.req.matches(id.version()) &&
-                                      &self.inner.source_id == id.source_id()))
+        self.inner.name == id.name()
+            && (self.inner.only_match_name
+                || (self.inner.req.matches(id.version())
+                    && &self.inner.source_id == id.source_id()))
     }
 
-    pub fn map_source(mut self, to_replace: &SourceId, replace_with: &SourceId)
-                      -> Dependency {
+    pub fn map_source(mut self, to_replace: &SourceId, replace_with: &SourceId) -> Dependency {
         if self.source_id() != to_replace {
             self
         } else {
@@ -326,19 +417,18 @@ impl Platform {
     pub fn matches(&self, name: &str, cfg: Option<&[Cfg]>) -> bool {
         match *self {
             Platform::Name(ref p) => p == name,
-            Platform::Cfg(ref p) => {
-                match cfg {
-                    Some(cfg) => p.matches(cfg),
-                    None => false,
-                }
-            }
+            Platform::Cfg(ref p) => match cfg {
+                Some(cfg) => p.matches(cfg),
+                None => false,
+            },
         }
     }
 }
 
 impl ser::Serialize for Platform {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-        where S: ser::Serializer,
+    where
+        S: ser::Serializer,
     {
         self.to_string().serialize(s)
     }
@@ -348,11 +438,12 @@ impl FromStr for Platform {
     type Err = CargoError;
 
     fn from_str(s: &str) -> CargoResult<Platform> {
-        if s.starts_with("cfg(") && s.ends_with(")") {
-            let s = &s[4..s.len()-1];
-            s.parse().map(Platform::Cfg).chain_err(|| {
-                format!("failed to parse `{}` as a cfg expression", s)
-            })
+        if s.starts_with("cfg(") && s.ends_with(')') {
+            let s = &s[4..s.len() - 1];
+            let p = s.parse()
+                .map(Platform::Cfg)
+                .chain_err(|| format_err!("failed to parse `{}` as a cfg expression", s))?;
+            Ok(p)
         } else {
             Ok(Platform::Name(s.to_string()))
         }

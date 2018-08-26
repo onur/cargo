@@ -2,32 +2,31 @@ use std::io::prelude::*;
 
 use toml;
 
-use core::{Resolve, resolver, Workspace};
 use core::resolver::WorkspaceResolve;
-use util::Filesystem;
+use core::{resolver, Resolve, Workspace};
 use util::errors::{CargoResult, CargoResultExt};
 use util::toml as cargo_toml;
+use util::Filesystem;
 
 pub fn load_pkg_lockfile(ws: &Workspace) -> CargoResult<Option<Resolve>> {
     if !ws.root().join("Cargo.lock").exists() {
-        return Ok(None)
+        return Ok(None);
     }
 
     let root = Filesystem::new(ws.root().to_path_buf());
     let mut f = root.open_ro("Cargo.lock", ws.config(), "Cargo.lock file")?;
 
     let mut s = String::new();
-    f.read_to_string(&mut s).chain_err(|| {
-        format!("failed to read file: {}", f.path().display())
-    })?;
+    f.read_to_string(&mut s)
+        .chain_err(|| format!("failed to read file: {}", f.path().display()))?;
 
-    (|| -> CargoResult<Option<Resolve>> {
-        let resolve : toml::Value = cargo_toml::parse(&s, f.path(), ws.config())?;
-        let v: resolver::EncodableResolve = resolve.try_into()?;
-        Ok(Some(v.into_resolve(ws)?))
-    })().chain_err(|| {
-        format!("failed to parse lock file at: {}", f.path().display())
-    })
+    let resolve =
+        (|| -> CargoResult<Option<Resolve>> {
+            let resolve: toml::Value = cargo_toml::parse(&s, f.path(), ws.config())?;
+            let v: resolver::EncodableResolve = resolve.try_into()?;
+            Ok(Some(v.into_resolve(ws)?))
+        })().chain_err(|| format!("failed to parse lock file at: {}", f.path().display()))?;
+    Ok(resolve)
 }
 
 pub fn write_pkg_lockfile(ws: &Workspace, resolve: &Resolve) -> CargoResult<()> {
@@ -40,29 +39,9 @@ pub fn write_pkg_lockfile(ws: &Workspace, resolve: &Resolve) -> CargoResult<()> 
         Ok(s)
     });
 
-    // Forward compatibility: if `orig` uses rootless format
-    // from the future, do the same.
-    let use_root_key = if let Ok(ref orig) = orig {
-        !orig.starts_with("[[package]]")
-    } else {
-        true
-    };
-
-    let toml = toml::Value::try_from(WorkspaceResolve {
-        ws: ws,
-        resolve: resolve,
-        use_root_key: use_root_key,
-    }).unwrap();
+    let toml = toml::Value::try_from(WorkspaceResolve { ws, resolve }).unwrap();
 
     let mut out = String::new();
-
-    // Note that we do not use e.toml.to_string() as we want to control the
-    // exact format the toml is in to ensure pretty diffs between updates to the
-    // lockfile.
-    if let Some(root) = toml.get("root") {
-        out.push_str("[root]\n");
-        emit_package(root.as_table().unwrap(), &mut out);
-    }
 
     let deps = toml["package"].as_array().unwrap();
     for dep in deps.iter() {
@@ -89,29 +68,60 @@ pub fn write_pkg_lockfile(ws: &Workspace, resolve: &Resolve) -> CargoResult<()> 
     // If the lockfile contents haven't changed so don't rewrite it. This is
     // helpful on read-only filesystems.
     if let Ok(orig) = orig {
-        if has_crlf_line_endings(&orig) {
-            out = out.replace("\n", "\r\n");
-        }
-        if out == orig {
-            return Ok(())
+        if are_equal_lockfiles(orig, &out, ws) {
+            return Ok(());
         }
     }
 
     if !ws.config().lock_update_allowed() {
-        let flag = if ws.config().network_allowed() {"--frozen"} else {"--locked"};
-        bail!("the lock file needs to be updated but {} was passed to \
-               prevent this", flag);
+        if ws.config().cli_unstable().offline {
+            bail!("can't update in the offline mode");
+        }
+
+        let flag = if ws.config().network_allowed() {
+            "--locked"
+        } else {
+            "--frozen"
+        };
+        bail!(
+            "the lock file needs to be updated but {} was passed to \
+             prevent this",
+            flag
+        );
     }
 
     // Ok, if that didn't work just write it out
-    ws_root.open_rw("Cargo.lock", ws.config(), "Cargo.lock file").and_then(|mut f| {
-        f.file().set_len(0)?;
-        f.write_all(out.as_bytes())?;
-        Ok(())
-    }).chain_err(|| {
-        format!("failed to write {}",
-                ws.root().join("Cargo.lock").display())
-    })
+    ws_root
+        .open_rw("Cargo.lock", ws.config(), "Cargo.lock file")
+        .and_then(|mut f| {
+            f.file().set_len(0)?;
+            f.write_all(out.as_bytes())?;
+            Ok(())
+        })
+        .chain_err(|| format!("failed to write {}", ws.root().join("Cargo.lock").display()))?;
+    Ok(())
+}
+
+fn are_equal_lockfiles(mut orig: String, current: &str, ws: &Workspace) -> bool {
+    if has_crlf_line_endings(&orig) {
+        orig = orig.replace("\r\n", "\n");
+    }
+
+    // If we want to try and avoid updating the lockfile, parse both and
+    // compare them; since this is somewhat expensive, don't do it in the
+    // common case where we can update lockfiles.
+    if !ws.config().lock_update_allowed() {
+        let res: CargoResult<bool> = (|| {
+            let old: resolver::EncodableResolve = toml::from_str(&orig)?;
+            let new: resolver::EncodableResolve = toml::from_str(current)?;
+            Ok(old.into_resolve(ws)? == new.into_resolve(ws)?)
+        })();
+        if let Ok(true) = res {
+            return true;
+        }
+    }
+
+    current == orig
 }
 
 fn has_crlf_line_endings(s: &str) -> bool {
@@ -131,7 +141,7 @@ fn emit_package(dep: &toml::value::Table, out: &mut String) {
         out.push_str(&format!("source = {}\n", &dep["source"]));
     }
 
-    if let Some(ref s) = dep.get("dependencies") {
+    if let Some(s) = dep.get("dependencies") {
         let slice = s.as_array().unwrap();
 
         if !slice.is_empty() {

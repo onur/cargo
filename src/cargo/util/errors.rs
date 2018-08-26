@@ -1,100 +1,81 @@
 #![allow(unknown_lints)]
 
-use std::error::Error;
 use std::fmt;
-use std::io;
-use std::num;
-use std::process::{Output, ExitStatus};
+use std::process::{ExitStatus, Output};
 use std::str;
-use std::string;
 
-use core::TargetKind;
+use core::{TargetKind, Workspace};
+use failure::{Context, Error, Fail};
+use clap;
 
-use curl;
-use git2;
-use semver;
-use serde_json;
-use toml;
-use registry;
-use ignore;
+pub use failure::Error as CargoError;
+pub type CargoResult<T> = Result<T, Error>;
 
-error_chain! {
-    types {
-        CargoError, CargoErrorKind, CargoResultExt, CargoResult;
-    }
+pub trait CargoResultExt<T, E> {
+    fn chain_err<F, D>(self, f: F) -> Result<T, Context<D>>
+    where
+        F: FnOnce() -> D,
+        D: fmt::Display + Send + Sync + 'static;
+}
 
-    links {
-        CrateRegistry(registry::Error, registry::ErrorKind);
-    }
-
-    foreign_links {
-        ParseSemver(semver::ReqParseError);
-        Semver(semver::SemVerError);
-        Ignore(ignore::Error);
-        Io(io::Error);
-        SerdeJson(serde_json::Error);
-        TomlSer(toml::ser::Error);
-        TomlDe(toml::de::Error);
-        ParseInt(num::ParseIntError);
-        ParseBool(str::ParseBoolError);
-        Parse(string::ParseError);
-        Git(git2::Error);
-        Curl(curl::Error);
-    }
-
-    errors {
-        Internal(err: Box<CargoErrorKind>) {
-            description(err.description())
-            display("{}", *err)
-        }
-        ProcessErrorKind(proc_err: ProcessError) {
-            description(&proc_err.desc)
-            display("{}", &proc_err.desc)
-        }
-        CargoTestErrorKind(test_err: CargoTestError) {
-            description(&test_err.desc)
-            display("{}", &test_err.desc)
-        }
-        HttpNot200(code: u32, url: String) {
-            description("failed to get a 200 response")
-            display("failed to get 200 response from `{}`, got {}", url, code)
-        }
+impl<T, E> CargoResultExt<T, E> for Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn chain_err<F, D>(self, f: F) -> Result<T, Context<D>>
+    where
+        F: FnOnce() -> D,
+        D: fmt::Display + Send + Sync + 'static,
+    {
+        self.map_err(|failure| {
+            let err = failure.into();
+            let context = f();
+            trace!("error: {}", err);
+            trace!("\tcontext: {}", context);
+            err.context(context)
+        })
     }
 }
 
-impl CargoError {
-    pub fn into_internal(self) -> Self {
-        CargoError(CargoErrorKind::Internal(Box::new(self.0)), self.1)
-    }
+#[derive(Debug, Fail)]
+#[fail(display = "failed to get 200 response from `{}`, got {}", url, code)]
+pub struct HttpNot200 {
+    pub code: u32,
+    pub url: String,
+}
 
-    fn is_human(&self) -> bool {
-        match &self.0 {
-            &CargoErrorKind::Msg(_) => true,
-            &CargoErrorKind::TomlSer(_) => true,
-            &CargoErrorKind::TomlDe(_) => true,
-            &CargoErrorKind::Curl(_) => true,
-            &CargoErrorKind::HttpNot200(..) => true,
-            &CargoErrorKind::ProcessErrorKind(_) => true,
-            &CargoErrorKind::CrateRegistry(_) => true,
-            &CargoErrorKind::ParseSemver(_) |
-            &CargoErrorKind::Semver(_) |
-            &CargoErrorKind::Ignore(_) |
-            &CargoErrorKind::Io(_) |
-            &CargoErrorKind::SerdeJson(_) |
-            &CargoErrorKind::ParseInt(_) |
-            &CargoErrorKind::ParseBool(_) |
-            &CargoErrorKind::Parse(_) |
-            &CargoErrorKind::Git(_) |
-            &CargoErrorKind::Internal(_) |
-            &CargoErrorKind::CargoTestErrorKind(_) => false
-        }
+pub struct Internal {
+    inner: Error,
+}
+
+impl Internal {
+    pub fn new(inner: Error) -> Internal {
+        Internal { inner }
     }
 }
 
+impl Fail for Internal {
+    fn cause(&self) -> Option<&Fail> {
+        self.inner.as_fail().cause()
+    }
+}
+
+impl fmt::Debug for Internal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl fmt::Display for Internal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
 
 // =============================================================================
 // Process errors
-#[derive(Debug)]
+#[derive(Debug, Fail)]
+#[fail(display = "{}", desc)]
 pub struct ProcessError {
     pub desc: String,
     pub exit: Option<ExitStatus>,
@@ -105,7 +86,8 @@ pub struct ProcessError {
 // Cargo test errors.
 
 /// Error when testcases fail
-#[derive(Debug)]
+#[derive(Debug, Fail)]
+#[fail(display = "{}", desc)]
 pub struct CargoTestError {
     pub test: Test,
     pub desc: String,
@@ -117,7 +99,11 @@ pub struct CargoTestError {
 pub enum Test {
     Multiple,
     Doc,
-    UnitTest(TargetKind, String)
+    UnitTest {
+        kind: TargetKind,
+        name: String,
+        pkg_name: String,
+    },
 }
 
 impl CargoTestError {
@@ -125,32 +111,51 @@ impl CargoTestError {
         if errors.is_empty() {
             panic!("Cannot create CargoTestError from empty Vec")
         }
-        let desc = errors.iter().map(|error| error.desc.clone())
-                                .collect::<Vec<String>>()
-                                .join("\n");
+        let desc = errors
+            .iter()
+            .map(|error| error.desc.clone())
+            .collect::<Vec<String>>()
+            .join("\n");
         CargoTestError {
-            test: test,
-            desc: desc,
+            test,
+            desc,
             exit: errors[0].exit,
             causes: errors,
         }
     }
 
-    pub fn hint(&self) -> String {
-        match &self.test {
-            &Test::UnitTest(ref kind, ref name) => {
+    pub fn hint(&self, ws: &Workspace) -> String {
+        match self.test {
+            Test::UnitTest {
+                ref kind,
+                ref name,
+                ref pkg_name,
+            } => {
+                let pkg_info = if ws.members().count() > 1 && ws.is_virtual() {
+                    format!("-p {} ", pkg_name)
+                } else {
+                    String::new()
+                };
+
                 match *kind {
-                    TargetKind::Bench => format!("test failed, to rerun pass '--bench {}'", name),
-                    TargetKind::Bin => format!("test failed, to rerun pass '--bin {}'", name),
-                    TargetKind::Lib(_) => "test failed, to rerun pass '--lib'".into(),
-                    TargetKind::Test => format!("test failed, to rerun pass '--test {}'", name),
-                    TargetKind::ExampleBin | TargetKind::ExampleLib(_) =>
-                        format!("test failed, to rerun pass '--example {}", name),
-                    _ => "test failed.".into()
+                    TargetKind::Bench => {
+                        format!("test failed, to rerun pass '{}--bench {}'", pkg_info, name)
+                    }
+                    TargetKind::Bin => {
+                        format!("test failed, to rerun pass '{}--bin {}'", pkg_info, name)
+                    }
+                    TargetKind::Lib(_) => format!("test failed, to rerun pass '{}--lib'", pkg_info),
+                    TargetKind::Test => {
+                        format!("test failed, to rerun pass '{}--test {}'", pkg_info, name)
+                    }
+                    TargetKind::ExampleBin | TargetKind::ExampleLib(_) => {
+                        format!("test failed, to rerun pass '{}--example {}", pkg_info, name)
+                    }
+                    _ => "test failed.".into(),
                 }
-            },
-            &Test::Doc => "test failed, to rerun pass '--doc'".into(),
-            _ => "test failed.".into()
+            }
+            Test::Doc => "test failed, to rerun pass '--doc'".into(),
+            _ => "test failed.".into(),
         }
     }
 }
@@ -164,38 +169,25 @@ pub type CliResult = Result<(), CliError>;
 pub struct CliError {
     pub error: Option<CargoError>,
     pub unknown: bool,
-    pub exit_code: i32
-}
-
-impl Error for CliError {
-    fn description(&self) -> &str {
-        self.error.as_ref().map(|e| e.description())
-            .unwrap_or("unknown cli error")
-    }
-
-    fn cause(&self) -> Option<&Error> {
-        self.error.as_ref().and_then(|e| e.cause())
-    }
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(ref error) = self.error {
-            error.fmt(f)
-        } else {
-            self.description().fmt(f)
-        }
-    }
+    pub exit_code: i32,
 }
 
 impl CliError {
     pub fn new(error: CargoError, code: i32) -> CliError {
-        let human = &error.is_human();
-        CliError { error: Some(error), exit_code: code, unknown: !human }
+        let unknown = error.downcast_ref::<Internal>().is_some();
+        CliError {
+            error: Some(error),
+            exit_code: code,
+            unknown,
+        }
     }
 
     pub fn code(code: i32) -> CliError {
-        CliError { error: None, exit_code: code, unknown: false }
+        CliError {
+            error: None,
+            exit_code: code,
+            unknown: false,
+        }
     }
 }
 
@@ -205,14 +197,21 @@ impl From<CargoError> for CliError {
     }
 }
 
+impl From<clap::Error> for CliError {
+    fn from(err: clap::Error) -> CliError {
+        let code = if err.use_stderr() { 1 } else { 0 };
+        CliError::new(err.into(), code)
+    }
+}
 
 // =============================================================================
 // Construction helpers
 
-pub fn process_error(msg: &str,
-                     status: Option<&ExitStatus>,
-                     output: Option<&Output>) -> ProcessError
-{
+pub fn process_error(
+    msg: &str,
+    status: Option<ExitStatus>,
+    output: Option<&Output>,
+) -> ProcessError {
     let exit = match status {
         Some(s) => status_to_string(s),
         None => "never executed".to_string(),
@@ -237,13 +236,13 @@ pub fn process_error(msg: &str,
     }
 
     return ProcessError {
-        desc: desc,
-        exit: status.cloned(),
+        desc,
+        exit: status,
         output: output.cloned(),
     };
 
     #[cfg(unix)]
-    fn status_to_string(status: &ExitStatus) -> String {
+    fn status_to_string(status: ExitStatus) -> String {
         use std::os::unix::process::*;
         use libc;
 
@@ -273,7 +272,7 @@ pub fn process_error(msg: &str,
     }
 
     #[cfg(windows)]
-    fn status_to_string(status: &ExitStatus) -> String {
+    fn status_to_string(status: ExitStatus) -> String {
         status.to_string()
     }
 }
@@ -283,5 +282,5 @@ pub fn internal<S: fmt::Display>(error: S) -> CargoError {
 }
 
 fn _internal(error: &fmt::Display) -> CargoError {
-    CargoError::from_kind(error.to_string().into()).into_internal()
+    Internal::new(format_err!("{}", error)).into()
 }

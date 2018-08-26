@@ -7,13 +7,10 @@ interested in the inner workings of Cargo.
 
 ## Subcommands
 
-Cargo is organized as a set of subcommands. All subcommands live in
-`src/bin` directory. However, only `src/bin/cargo.rs` file produces an
-executable, other files inside the `bin` directory are submodules. See
-`src/bin/cargo.rs` for how these subcommands get wired up with the
-main executable.
+Cargo is organized as a set of `clap` subcommands. All subcommands live in
+`src/bin/cargo/commands` directory. `src/bin/cargo/main.rs` is the entry point.
 
-A typical subcommand, such as `src/bin/build.rs`, parses command line
+A typical subcommand, such as `src/bin/cargo/commands/build.rs`, parses command line
 options, reads the configuration files, discovers the Cargo project in
 the current directory and delegates the actual implementation to one
 of the functions in `src/cargo/ops/mod.rs`. This short file is a good
@@ -88,3 +85,50 @@ verified against the expected output. To simplify testing, several
 macros of the form `[MACRO]` are used in the expected output. For
 example, `[..]` matches any string and `[/]` matches `/` on Unixes and
 `\` on windows.
+
+To see stdout and stderr streams of the subordinate process, add `.stream()` 
+call to `execs()`:
+
+```rust
+// Before
+assert_that(
+    p.cargo("run"),
+    execs()
+);
+
+// After
+assert_that(
+    p.cargo("run"),
+    execs().stream()
+);
+```
+
+Alternatively to build and run a custom version of cargo simply run `cargo build`
+and execute `target/debug/cargo`. Note that `+nightly`/`+stable` (and variants),
+being [rustup](https://rustup.rs/) features, won't work when executing the locally
+built cargo binary directly, you have to instead build with `cargo +nightly build`
+and run with `rustup run` (e.g `rustup run nightly
+<path-to-cargo>/target/debug/cargo <args>..`) (or set the `RUSTC` env var to point
+to nightly rustc).
+
+Because the test suite has `#![deny(warnings)]` at times you might find it
+convenient to override this with `RUSTFLAGS`, for example
+`RUSTFLAGS="--cap-lints warn" cargo build`.
+
+## Logging
+
+Cargo uses [`env_logger`](https://docs.rs/env_logger/*/env_logger/), so you can set
+`RUST_LOG` environment variable to get the logs. This is useful both for diagnosing
+bugs in stable Cargo and for local development. Cargo also has internal hierarchical 
+profiling infrastructure, which is activated via `CARGO_PROFILE` variable 
+
+```
+# Outputs all logs with levels debug and higher  
+$ RUST_LOG=debug cargo generate-lockfile
+
+# Don't forget that you can filter by module as well 
+$ RUST_LOG=cargo::core::resolver=trace cargo generate-lockfile
+
+# Output first three levels of profiling info
+$ CARGO_PROFILE=3 cargo generate-lockfile
+```

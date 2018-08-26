@@ -1,52 +1,68 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+
+use failure::Fail;
+use opener;
 
 use core::Workspace;
 use ops;
 use util::CargoResult;
 
+/// Strongly typed options for the `cargo doc` command.
+#[derive(Debug)]
 pub struct DocOptions<'a> {
+    /// Whether to attempt to open the browser after compiling the docs
     pub open_result: bool,
+    /// Options to pass through to the compiler
     pub compile_opts: ops::CompileOptions<'a>,
 }
 
+/// Main method for `cargo doc`.
 pub fn doc(ws: &Workspace, options: &DocOptions) -> CargoResult<()> {
-    let specs = options.compile_opts.spec.into_package_id_specs(ws)?;
-    let resolve = ops::resolve_ws_precisely(ws,
-                                            None,
-                                            options.compile_opts.features,
-                                            options.compile_opts.all_features,
-                                            options.compile_opts.no_default_features,
-                                            &specs)?;
+    let specs = options.compile_opts.spec.to_package_id_specs(ws)?;
+    let resolve = ops::resolve_ws_precisely(
+        ws,
+        None,
+        &options.compile_opts.features,
+        options.compile_opts.all_features,
+        options.compile_opts.no_default_features,
+        &specs,
+    )?;
     let (packages, resolve_with_overrides) = resolve;
 
-    let mut pkgs = Vec::new();
-    if specs.len() > 0 {
-        for p in specs.iter() {
-            pkgs.push(packages.get(p.query(resolve_with_overrides.iter())?)?);
-        }
-    } else {
-        let root_package = ws.current()?;
-        pkgs.push(root_package);
-    };
+    let pkgs = specs
+        .iter()
+        .map(|p| {
+            let pkgid = p.query(resolve_with_overrides.iter())?;
+            packages.get(pkgid)
+        })
+        .collect::<CargoResult<Vec<_>>>()?;
 
-    let mut lib_names = HashSet::new();
-    let mut bin_names = HashSet::new();
+    let mut lib_names = HashMap::new();
+    let mut bin_names = HashMap::new();
     for package in &pkgs {
         for target in package.targets().iter().filter(|t| t.documented()) {
             if target.is_lib() {
-                assert!(lib_names.insert(target.crate_name()));
-            } else {
-                assert!(bin_names.insert(target.crate_name()));
-            }
-        }
-        for bin in bin_names.iter() {
-            if lib_names.contains(bin) {
-                bail!("cannot document a package where a library and a binary \
-                       have the same name. Consider renaming one or marking \
-                       the target as `doc = false`")
+                if let Some(prev) = lib_names.insert(target.crate_name(), package) {
+                    bail!(
+                        "The library `{}` is specified by packages `{}` and \
+                         `{}` but can only be documented once. Consider renaming \
+                         or marking one of the targets as `doc = false`.",
+                        target.crate_name(),
+                        prev,
+                        package
+                    );
+                }
+            } else if let Some(prev) = bin_names.insert(target.crate_name(), package) {
+                bail!(
+                    "The binary `{}` is specified by packages `{}` and \
+                     `{}` but can be documented only once. Consider renaming \
+                     or marking one of the targets as `doc = false`.",
+                    target.crate_name(),
+                    prev,
+                    package
+                );
             }
         }
     }
@@ -55,11 +71,17 @@ pub fn doc(ws: &Workspace, options: &DocOptions) -> CargoResult<()> {
 
     if options.open_result {
         let name = if pkgs.len() > 1 {
-            bail!("Passing multiple packages and `open` is not supported")
-        } else if pkgs.len() == 1 {
-            pkgs[0].name().replace("-", "_")
+            bail!(
+                "Passing multiple packages and `open` is not supported.\n\
+                 Please re-run this command with `-p <spec>` where `<spec>` \
+                 is one of the following:\n  {}",
+                pkgs.iter()
+                    .map(|p| p.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            );
         } else {
-            match lib_names.iter().chain(bin_names.iter()).nth(0) {
+            match lib_names.keys().chain(bin_names.keys()).nth(0) {
                 Some(s) => s.to_string(),
                 None => return Ok(()),
             }
@@ -69,7 +91,7 @@ pub fn doc(ws: &Workspace, options: &DocOptions) -> CargoResult<()> {
         // nothing we can do about it and otherwise if it's getting overwritten
         // then that's also ok!
         let mut target_dir = ws.target_dir();
-        if let Some(triple) = options.compile_opts.target {
+        if let Some(ref triple) = options.compile_opts.build_config.requested_target {
             target_dir.push(Path::new(triple).file_stem().unwrap());
         }
         let path = target_dir.join("doc").join(&name).join("index.html");
@@ -77,56 +99,14 @@ pub fn doc(ws: &Workspace, options: &DocOptions) -> CargoResult<()> {
         if fs::metadata(&path).is_ok() {
             let mut shell = options.compile_opts.config.shell();
             shell.status("Opening", path.display())?;
-            match open_docs(&path) {
-                Ok(m) => shell.status("Launching", m)?,
-                Err(e) => {
-                    shell.warn(
-                            "warning: could not determine a browser to open docs with, tried:")?;
-                    for method in e {
-                        shell.warn(format!("\t{}", method))?;
-                    }
+            if let Err(e) = opener::open(&path) {
+                shell.warn(format!("Couldn't open docs: {}", e))?;
+                for cause in (&e as &Fail).iter_chain() {
+                    shell.warn(format!("Caused by:\n {}", cause))?;
                 }
             }
         }
     }
 
     Ok(())
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn open_docs(path: &Path) -> Result<&'static str, Vec<&'static str>> {
-    use std::env;
-    let mut methods = Vec::new();
-    // trying $BROWSER
-    if let Ok(name) = env::var("BROWSER") {
-        match Command::new(name).arg(path).status() {
-            Ok(_) => return Ok("$BROWSER"),
-            Err(_) => methods.push("$BROWSER"),
-        }
-    }
-
-    for m in ["xdg-open", "gnome-open", "kde-open"].iter() {
-        match Command::new(m).arg(path).status() {
-            Ok(_) => return Ok(m),
-            Err(_) => methods.push(m),
-        }
-    }
-
-    Err(methods)
-}
-
-#[cfg(target_os = "windows")]
-fn open_docs(path: &Path) -> Result<&'static str, Vec<&'static str>> {
-    match Command::new("cmd").arg("/C").arg(path).status() {
-        Ok(_) => Ok("cmd /C"),
-        Err(_) => Err(vec!["cmd /C"]),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn open_docs(path: &Path) -> Result<&'static str, Vec<&'static str>> {
-    match Command::new("open").arg(path).status() {
-        Ok(_) => Ok("open"),
-        Err(_) => Err(vec!["open"]),
-    }
 }

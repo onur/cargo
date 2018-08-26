@@ -18,7 +18,7 @@
 //!    the `Manifest::feature_gate` function, but otherwise you may wish to
 //!    place the feature gate elsewhere in Cargo.
 //!
-//! 3. Do actually perform the feature gate, you'll want to have code that looks
+//! 3. To actually perform the feature gate, you'll want to have code that looks
 //!    like:
 //!
 //! ```rust,ignore
@@ -31,17 +31,59 @@
 //! })?;
 //! ```
 //!
-//! Notably you'll notice the `require` funciton called with your `Feature`, and
+//! Notably you'll notice the `require` function called with your `Feature`, and
 //! then you use `chain_err` to tack on more context for why the feature was
 //! required when the feature isn't activated.
+//!
+//! 4. Update the unstable documentation at
+//!    `src/doc/src/reference/unstable.md` to include a short description of
+//!    how to use your new feature.  When the feature is stabilized, be sure
+//!    that the Cargo Guide or Reference is updated to fully document the
+//!    feature and remove the entry from the Unstable section.
 //!
 //! And hopefully that's it! Bear with us though that this is, at the time of
 //! this writing, a very new feature in Cargo. If the process differs from this
 //! we'll be sure to update this documentation!
 
+use std::cell::Cell;
 use std::env;
+use std::fmt;
+use std::str::FromStr;
+
+use failure::Error;
 
 use util::errors::CargoResult;
+
+/// The edition of the compiler (RFC 2052)
+#[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Edition {
+    /// The 2015 edition
+    Edition2015,
+    /// The 2018 edition
+    Edition2018,
+}
+
+impl fmt::Display for Edition {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Edition::Edition2015 => f.write_str("2015"),
+            Edition::Edition2018 => f.write_str("2018"),
+        }
+    }
+}
+impl FromStr for Edition {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        match s {
+            "2015" => Ok(Edition::Edition2015),
+            "2018" => Ok(Edition::Edition2018),
+            s => {
+                bail!("supported edition values are `2015` or `2018`, but `{}` \
+                       is unknown", s)
+            }
+        }
+    }
+}
 
 enum Status {
     Stable,
@@ -68,7 +110,7 @@ macro_rules! features {
                     }
                     static FEAT: Feature = Feature {
                         name: stringify!($feature),
-                        get: get,
+                        get,
                     };
                     &FEAT
                 }
@@ -97,8 +139,12 @@ macro_rules! features {
 }
 
 macro_rules! stab {
-    (stable) => (Status::Stable);
-    (unstable) => (Status::Unstable);
+    (stable) => {
+        Status::Stable
+    };
+    (unstable) => {
+        Status::Unstable
+    };
 }
 
 /// A listing of all features in Cargo
@@ -122,6 +168,30 @@ features! {
         // A dummy feature that gates the usage of the `im-a-teapot` manifest
         // entry. This is basically just intended for tests.
         [unstable] test_dummy_unstable: bool,
+
+        // Downloading packages from alternative registry indexes.
+        [unstable] alternative_registries: bool,
+
+        // Using editions
+        [unstable] edition: bool,
+
+        // Renaming a package in the manifest via the `package` key
+        [unstable] rename_dependency: bool,
+
+        // Whether a lock file is published with this crate
+        [unstable] publish_lockfile: bool,
+
+        // Overriding profiles for dependencies.
+        [unstable] profile_overrides: bool,
+
+        // Separating the namespaces for features and dependencies
+        [unstable] namespaced_features: bool,
+
+        // "default-run" manifest option,
+        [unstable] default_run: bool,
+
+        // Declarative build scripts.
+        [unstable] metabuild: bool,
     }
 }
 
@@ -131,8 +201,7 @@ pub struct Feature {
 }
 
 impl Features {
-    pub fn new(features: &[String],
-               warnings: &mut Vec<String>) -> CargoResult<Features> {
+    pub fn new(features: &[String], warnings: &mut Vec<String>) -> CargoResult<Features> {
         let mut ret = Features::default();
         for feature in features {
             ret.add(feature, warnings)?;
@@ -148,22 +217,25 @@ impl Features {
         };
 
         if *slot {
-            bail!("the cargo feature `{}` has already bene activated", feature);
+            bail!("the cargo feature `{}` has already been activated", feature);
         }
 
         match status {
             Status::Stable => {
-                let warning = format!("the cargo feature `{}` is now stable \
-                                       and is no longer necessary to be listed \
-                                       in the manifest", feature);
+                let warning = format!(
+                    "the cargo feature `{}` is now stable \
+                     and is no longer necessary to be listed \
+                     in the manifest",
+                    feature
+                );
                 warnings.push(warning);
             }
-            Status::Unstable if !nightly_features_allowed() => {
-                bail!("the cargo feature `{}` requires a nightly version of \
-                       Cargo, but this is the `{}` channel",
-                      feature,
-                      channel())
-            }
+            Status::Unstable if !nightly_features_allowed() => bail!(
+                "the cargo feature `{}` requires a nightly version of \
+                 Cargo, but this is the `{}` channel",
+                feature,
+                channel()
+            ),
             Status::Unstable => {}
         }
 
@@ -184,23 +256,32 @@ impl Features {
             let mut msg = format!("feature `{}` is required", feature);
 
             if nightly_features_allowed() {
-                let s = format!("\n\nconsider adding `cargo-features = [\"{0}\"]` \
-                                 to the manifest", feature);
+                let s = format!(
+                    "\n\nconsider adding `cargo-features = [\"{0}\"]` \
+                     to the manifest",
+                    feature
+                );
                 msg.push_str(&s);
             } else {
-                let s = format!("\n\n\
-                    this Cargo does not support nightly features, but if you\n\
-                    switch to nightly channel you can add\n\
-                    `cargo-features = [\"{}\"]` to enable this feature",
-                    feature);
+                let s = format!(
+                    "\n\n\
+                     this Cargo does not support nightly features, but if you\n\
+                     switch to nightly channel you can add\n\
+                     `cargo-features = [\"{}\"]` to enable this feature",
+                    feature
+                );
                 msg.push_str(&s);
             }
             bail!("{}", msg);
         }
     }
+
+    pub fn is_enabled(&self, feature: &Feature) -> bool {
+        feature.is_enabled(self)
+    }
 }
 
-/// A parsed represetnation of all unstable flags that Cargo accepts.
+/// A parsed representation of all unstable flags that Cargo accepts.
 ///
 /// Cargo, like `rustc`, accepts a suite of `-Z` flags which are intended for
 /// gating unstable functionality to Cargo. These flags are only available on
@@ -228,11 +309,20 @@ impl Features {
 #[derive(Default, Debug)]
 pub struct CliUnstable {
     pub print_im_a_teapot: bool,
+    pub unstable_options: bool,
+    pub offline: bool,
+    pub no_index_update: bool,
+    pub avoid_dev_deps: bool,
+    pub minimal_versions: bool,
+    pub package_features: bool,
+    pub advanced_env: bool,
+    pub config_profile: bool,
+    pub compile_progress: bool,
 }
 
 impl CliUnstable {
     pub fn parse(&mut self, flags: &[String]) -> CargoResult<()> {
-        if flags.len() > 0 && !nightly_features_allowed() {
+        if !flags.is_empty() && !nightly_features_allowed() {
             bail!("the `-Z` flag is only accepted on the nightly channel of Cargo")
         }
         for flag in flags {
@@ -248,8 +338,7 @@ impl CliUnstable {
 
         fn parse_bool(value: Option<&str>) -> CargoResult<bool> {
             match value {
-                None |
-                Some("yes") => Ok(true),
+                None | Some("yes") => Ok(true),
                 Some("no") => Ok(false),
                 Some(s) => bail!("expected `no` or `yes`, found: {}", s),
             }
@@ -257,6 +346,15 @@ impl CliUnstable {
 
         match k {
             "print-im-a-teapot" => self.print_im_a_teapot = parse_bool(v)?,
+            "unstable-options" => self.unstable_options = true,
+            "offline" => self.offline = true,
+            "no-index-update" => self.no_index_update = true,
+            "avoid-dev-deps" => self.avoid_dev_deps = true,
+            "minimal-versions" => self.minimal_versions = true,
+            "package-features" => self.package_features = true,
+            "advanced-env" => self.advanced_env = true,
+            "config-profile" => self.config_profile = true,
+            "compile-progress" => self.compile_progress = true,
             _ => bail!("unknown `-Z` flag specified: {}", k),
         }
 
@@ -265,15 +363,59 @@ impl CliUnstable {
 }
 
 fn channel() -> String {
-    env::var("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS").unwrap_or_else(|_| {
-        ::version().cfg_info.map(|c| c.release_channel)
-            .unwrap_or(String::from("dev"))
-    })
+    if let Ok(override_channel) = env::var("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS") {
+        return override_channel;
+    }
+    if let Ok(staging) = env::var("RUSTC_BOOTSTRAP") {
+        if staging == "1" {
+            return "dev".to_string();
+        }
+    }
+    ::version()
+        .cfg_info
+        .map(|c| c.release_channel)
+        .unwrap_or_else(|| String::from("dev"))
 }
 
-fn nightly_features_allowed() -> bool {
-    match &channel()[..] {
-        "nightly" | "dev" => true,
+thread_local!(
+    static NIGHTLY_FEATURES_ALLOWED: Cell<bool> = Cell::new(false);
+    static ENABLE_NIGHTLY_FEATURES: Cell<bool> = Cell::new(false);
+);
+
+/// This is a little complicated.
+/// This should return false if:
+/// - this is an artifact of the rustc distribution process for "stable" or for "beta"
+/// - this is an `#[test]` that does not opt in with `enable_nightly_features`
+/// - this is a integration test that uses `ProcessBuilder`
+///      that does not opt in with `masquerade_as_nightly_cargo`
+/// This should return true if:
+/// - this is an artifact of the rustc distribution process for "nightly"
+/// - this is being used in the rustc distribution process internally
+/// - this is a cargo executable that was built from source
+/// - this is an `#[test]` that called `enable_nightly_features`
+/// - this is a integration test that uses `ProcessBuilder`
+///       that called `masquerade_as_nightly_cargo`
+pub fn nightly_features_allowed() -> bool {
+    if ENABLE_NIGHTLY_FEATURES.with(|c| c.get()) {
+        return true
+    }
+     match &channel()[..] {
+        "nightly" | "dev" => NIGHTLY_FEATURES_ALLOWED.with(|c| c.get()),
         _ => false,
     }
+}
+
+/// Allows nightly features to be enabled for this thread, but only if the
+/// development channel is nightly or dev.
+///
+/// Used by cargo main to ensure that a cargo build from source has nightly features
+pub fn maybe_allow_nightly_features() {
+    NIGHTLY_FEATURES_ALLOWED.with(|c| c.set(true));
+}
+
+/// Forcibly enables nightly features for this thread.
+///
+/// Used by tests to allow the use of nightly features.
+pub fn enable_nightly_features() {
+    ENABLE_NIGHTLY_FEATURES.with(|c| c.set(true));
 }

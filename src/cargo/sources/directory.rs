@@ -4,11 +4,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use hex::ToHex;
+use hex;
 
 use serde_json;
 
-use core::{Package, PackageId, Summary, SourceId, Source, Dependency, Registry};
+use core::{Dependency, Package, PackageId, Source, SourceId, Summary};
 use sources::PathSource;
 use util::{Config, Sha256};
 use util::errors::{CargoResult, CargoResultExt};
@@ -23,17 +23,16 @@ pub struct DirectorySource<'cfg> {
 
 #[derive(Deserialize)]
 struct Checksum {
-    package: String,
+    package: Option<String>,
     files: HashMap<String, String>,
 }
 
 impl<'cfg> DirectorySource<'cfg> {
-    pub fn new(path: &Path, id: &SourceId, config: &'cfg Config)
-               -> DirectorySource<'cfg> {
+    pub fn new(path: &Path, id: &SourceId, config: &'cfg Config) -> DirectorySource<'cfg> {
         DirectorySource {
             source_id: id.clone(),
             root: path.to_path_buf(),
-            config: config,
+            config,
             packages: HashMap::new(),
         }
     }
@@ -45,10 +44,8 @@ impl<'cfg> Debug for DirectorySource<'cfg> {
     }
 }
 
-impl<'cfg> Registry for DirectorySource<'cfg> {
-    fn query(&mut self,
-             dep: &Dependency,
-             f: &mut FnMut(Summary)) -> CargoResult<()> {
+impl<'cfg> Source for DirectorySource<'cfg> {
+    fn query(&mut self, dep: &Dependency, f: &mut FnMut(Summary)) -> CargoResult<()> {
         let packages = self.packages.values().map(|p| &p.0);
         let matches = packages.filter(|pkg| dep.matches(pkg.summary()));
         for summary in matches.map(|pkg| pkg.summary().clone()) {
@@ -57,12 +54,22 @@ impl<'cfg> Registry for DirectorySource<'cfg> {
         Ok(())
     }
 
+    fn fuzzy_query(&mut self, _dep: &Dependency, f: &mut FnMut(Summary)) -> CargoResult<()> {
+        let packages = self.packages.values().map(|p| &p.0);
+        for summary in packages.map(|pkg| pkg.summary().clone()) {
+            f(summary);
+        }
+        Ok(())
+    }
+
     fn supports_checksums(&self) -> bool {
         true
     }
-}
 
-impl<'cfg> Source for DirectorySource<'cfg> {
+    fn requires_precise(&self) -> bool {
+        true
+    }
+
     fn source_id(&self) -> &SourceId {
         &self.source_id
     }
@@ -70,8 +77,10 @@ impl<'cfg> Source for DirectorySource<'cfg> {
     fn update(&mut self) -> CargoResult<()> {
         self.packages.clear();
         let entries = self.root.read_dir().chain_err(|| {
-            format!("failed to read root of directory source: {}",
-                    self.root.display())
+            format!(
+                "failed to read root of directory source: {}",
+                self.root.display()
+            )
         })?;
 
         for entry in entries {
@@ -83,7 +92,7 @@ impl<'cfg> Source for DirectorySource<'cfg> {
             // (rust-lang/cargo#3414).
             if let Some(s) = path.file_name().and_then(|s| s.to_str()) {
                 if s.starts_with('.') {
-                    continue
+                    continue;
                 }
             }
 
@@ -93,24 +102,17 @@ impl<'cfg> Source for DirectorySource<'cfg> {
             // when a dir is removed from a different checkout. Sometimes a
             // mostly-empty dir is left behind.
             //
-            // To help work Cargo work by default in more cases we try to
-            // handle this case by default. If the directory looks like it only
-            // has dotfiles in it (or no files at all) then we skip it.
+            // Additionally vendor directories are sometimes accompanied with
+            // readme files and other auxiliary information not too interesting
+            // to Cargo.
             //
-            // In general we don't want to skip completely malformed directories
-            // to help with debugging, so we don't just ignore errors in
-            // `update` below.
-            let mut only_dotfile = true;
-            for entry in path.read_dir()?.filter_map(|e| e.ok()) {
-                if let Some(s) = entry.file_name().to_str() {
-                    if s.starts_with(".") {
-                        continue
-                    }
-                }
-                only_dotfile = false;
-            }
-            if only_dotfile {
-                continue
+            // To help handle all this we only try processing folders with a
+            // `Cargo.toml` in them. This has the upside of being pretty
+            // flexible with the contents of vendor directories but has the
+            // downside of accidentally misconfigured vendor directories
+            // silently returning less crates.
+            if !path.join("Cargo.toml").exists() {
+                continue;
             }
 
             let mut src = PathSource::new(&path, &self.source_id, self.config);
@@ -119,22 +121,28 @@ impl<'cfg> Source for DirectorySource<'cfg> {
 
             let cksum_file = path.join(".cargo-checksum.json");
             let cksum = paths::read(&path.join(cksum_file)).chain_err(|| {
-                format!("failed to load checksum `.cargo-checksum.json` \
-                         of {} v{}",
-                        pkg.package_id().name(),
-                        pkg.package_id().version())
-
+                format!(
+                    "failed to load checksum `.cargo-checksum.json` \
+                     of {} v{}",
+                    pkg.package_id().name(),
+                    pkg.package_id().version()
+                )
             })?;
             let cksum: Checksum = serde_json::from_str(&cksum).chain_err(|| {
-                format!("failed to decode `.cargo-checksum.json` of \
-                         {} v{}",
-                        pkg.package_id().name(),
-                        pkg.package_id().version())
+                format!(
+                    "failed to decode `.cargo-checksum.json` of \
+                     {} v{}",
+                    pkg.package_id().name(),
+                    pkg.package_id().version()
+                )
             })?;
 
             let mut manifest = pkg.manifest().clone();
-            let summary = manifest.summary().clone();
-            manifest.set_summary(summary.set_checksum(cksum.package.clone()));
+            let mut summary = manifest.summary().clone();
+            if let Some(ref package) = cksum.package {
+                summary = summary.set_checksum(package.clone());
+            }
+            manifest.set_summary(summary);
             let pkg = Package::new(manifest, pkg.manifest_path());
             self.packages.insert(pkg.package_id().clone(), (pkg, cksum));
         }
@@ -143,9 +151,11 @@ impl<'cfg> Source for DirectorySource<'cfg> {
     }
 
     fn download(&mut self, id: &PackageId) -> CargoResult<Package> {
-        self.packages.get(id).map(|p| &p.0).cloned().ok_or_else(|| {
-            format!("failed to find package with id: {}", id).into()
-        })
+        self.packages
+            .get(id)
+            .map(|p| &p.0)
+            .cloned()
+            .ok_or_else(|| format_err!("failed to find package with id: {}", id))
     }
 
     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {
@@ -155,8 +165,7 @@ impl<'cfg> Source for DirectorySource<'cfg> {
     fn verify(&self, id: &PackageId) -> CargoResult<()> {
         let (pkg, cksum) = match self.packages.get(id) {
             Some(&(ref pkg, ref cksum)) => (pkg, cksum),
-            None => bail!("failed to find entry for `{}` in directory source",
-                          id),
+            None => bail!("failed to find entry for `{}` in directory source", id),
         };
 
         let mut buf = [0; 16 * 1024];
@@ -172,23 +181,26 @@ impl<'cfg> Source for DirectorySource<'cfg> {
                         n => h.update(&buf[..n]),
                     }
                 }
-            })().chain_err(|| {
-                format!("failed to calculate checksum of: {}",
-                        file.display())
-            })?;
+            })()
+                .chain_err(|| format!("failed to calculate checksum of: {}", file.display()))?;
 
-            let actual = h.finish().to_hex();
+            let actual = hex::encode(h.finish());
             if &*actual != cksum {
-                bail!("\
-                    the listed checksum of `{}` has changed:\n\
-                    expected: {}\n\
-                    actual:   {}\n\
-                    \n\
-                    directory sources are not intended to be edited, if \
-                    modifications are required then it is recommended \
-                    that [replace] is used with a forked copy of the \
-                    source\
-                ", file.display(), cksum, actual);
+                bail!(
+                    "\
+                     the listed checksum of `{}` has changed:\n\
+                     expected: {}\n\
+                     actual:   {}\n\
+                     \n\
+                     directory sources are not intended to be edited, if \
+                     modifications are required then it is recommended \
+                     that [replace] is used with a forked copy of the \
+                     source\
+                     ",
+                    file.display(),
+                    cksum,
+                    actual
+                );
             }
         }
 
